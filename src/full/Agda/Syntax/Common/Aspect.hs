@@ -124,6 +124,7 @@ data Aspects = Aspects
   , definitionSite :: Maybe DefinitionSite
     -- ^ The definition site of the annotated thing, if applicable and
     --   known.
+  , aspectRange :: Range
   , tokenBased :: !TokenBased
     -- ^ Is this entry token-based?
   }
@@ -152,7 +153,7 @@ data TokenBased = TokenBased | NotOnlyTokenBased
   deriving (Eq, Show)
 
 instance Eq Aspects where
-  Aspects a o _ d t == Aspects a' o' _ d' t' =
+  Aspects a o _ d _ t == Aspects a' o' _ d' _ t' =
     (a, o, d, t) == (a', o', d', t')
 
 instance NFData Induction where

@@ -97,42 +97,56 @@ instance ToLsp Aspect where
     Keyword -> Lsp.SemanticTokenTypes_Keyword
     String  -> Lsp.SemanticTokenTypes_String
     Number  -> Lsp.SemanticTokenTypes_Number
-    Hole    -> Lsp.SemanticTokenTypes_Custom "InteractionPoint"
-    Symbol  -> Lsp.SemanticTokenTypes_Custom "Symbol"
-    PrimitiveType -> Lsp.SemanticTokenTypes_Type
+    Hole    -> Lsp.SemanticTokenTypes_Custom "interactionPoint"
+    Symbol  -> Lsp.SemanticTokenTypes_Custom "symbol"
+    PrimitiveType -> Lsp.SemanticTokenTypes_Custom "primitiveType"
     Name Nothing _ -> Lsp.SemanticTokenTypes_Variable
     Name (Just kind) _ -> case kind of
-      Asp.Bound         -> Lsp.SemanticTokenTypes_Variable
-      Asp.Generalizable -> Lsp.SemanticTokenTypes_Variable
-      Asp.Constructor _ -> Lsp.SemanticTokenTypes_EnumMember
-      Asp.Datatype      -> Lsp.SemanticTokenTypes_Enum
-      Asp.Field         -> Lsp.SemanticTokenTypes_Property
-      Asp.Function      -> Lsp.SemanticTokenTypes_Function
-      Asp.Module        -> Lsp.SemanticTokenTypes_Namespace
-      Asp.Postulate     -> Lsp.SemanticTokenTypes_Custom "Postulate"
-      Asp.Primitive     -> Lsp.SemanticTokenTypes_Custom "Primitive"
-      Asp.Record        -> Lsp.SemanticTokenTypes_Struct
-      Asp.Argument      -> Lsp.SemanticTokenTypes_Variable
-      Asp.Macro         -> Lsp.SemanticTokenTypes_Macro
-    Pragma     -> Lsp.SemanticTokenTypes_Custom "Pragma"
-    Background -> Lsp.SemanticTokenTypes_Custom "Background"
-    Markup     -> Lsp.SemanticTokenTypes_Custom "Markup"
+      Asp.Bound                   -> Lsp.SemanticTokenTypes_Variable
+      Asp.Generalizable           -> Lsp.SemanticTokenTypes_TypeParameter
+      Asp.Constructor Inductive   -> Lsp.SemanticTokenTypes_EnumMember
+      Asp.Constructor CoInductive -> Lsp.SemanticTokenTypes_Custom "coinductiveCons"
+      Asp.Datatype                -> Lsp.SemanticTokenTypes_Enum
+      Asp.Field                   -> Lsp.SemanticTokenTypes_Property
+      Asp.Function                -> Lsp.SemanticTokenTypes_Function
+      Asp.Module                  -> Lsp.SemanticTokenTypes_Namespace
+      Asp.Postulate               -> Lsp.SemanticTokenTypes_Custom "postulate"
+      Asp.Primitive               -> Lsp.SemanticTokenTypes_Custom "primitive"
+      Asp.Record                  -> Lsp.SemanticTokenTypes_Struct
+      Asp.Argument                -> Lsp.SemanticTokenTypes_Parameter
+      Asp.Macro                   -> Lsp.SemanticTokenTypes_Macro
+    Pragma     -> Lsp.SemanticTokenTypes_Custom "pragma"
+    Background -> Lsp.SemanticTokenTypes_Custom "background"
+    Markup     -> Lsp.SemanticTokenTypes_Custom "markup"
 
-data OffsetToken = OffsetToken
-  { tokenStart :: Int
-  , tokenEnd   :: Int
-  , tokenType  :: Lsp.SemanticTokenTypes
+agdaTokenLegend :: Lsp.SemanticTokensLegend
+agdaTokenLegend = Lsp.SemanticTokensLegend
+  { _tokenTypes =
+    [ "comment", "keyword", "string", "number", "interactionPoint",
+    "symbol", "primitiveType", "variable", "typeParameter",
+    "enumMember", "coinductiveCons", "enum", "property", "function",
+    "namespace", "postulate", "primitive", "struct", "parameter",
+    "macro", "pragma", "background", "markup" ]
+  , _tokenModifiers = []
   }
-  deriving (Show, Generic)
 
-instance ToJSON OffsetToken
-
-aspectMapToTokens :: RangeMap Aspects -> [OffsetToken]
-aspectMapToTokens = mapMaybe go . RangeMap.toList where
-  go (Hl.Range start end, aspects) = case aspect aspects of
-    Just asp -> Just OffsetToken
-      { tokenStart = start
-      , tokenEnd   = end
-      , tokenType  = toLsp asp
-      }
-    _ -> Nothing
+aspectMapToTokens :: RangeMap Aspects -> [Lsp.SemanticTokenAbsolute]
+aspectMapToTokens = concatMap go . RangeMap.toList where
+  go (_, asp@Aspects{aspectRange = range}) = case aspect asp of
+    Just asp ->
+      let
+        tok ival = Lsp.SemanticTokenAbsolute
+          { _tokenType      = toLsp asp
+          , _line           = fromIntegral (posLine (iStart ival) - 1)
+          , _startChar      = fromIntegral (posCol (iStart ival) - 1)
+          , _length         = fromIntegral (posPos (iEnd ival) - posPos (iStart ival))
+          , _tokenModifiers = []
+          }
+      in map tok (rangeIntervals range)
+      -- Just OffsetToken
+      -- { tokenStart     = start
+      -- , tokenEnd       = end
+      -- , tokenType      = toLsp asp
+      -- , tokenSyntactic = tokenBased aspects == TokenBased
+      -- }
+    _ -> []
