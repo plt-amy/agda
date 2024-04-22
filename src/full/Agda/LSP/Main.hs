@@ -19,7 +19,7 @@ import Data.Proxy
 import GHC.Generics
 
 import Language.LSP.Protocol.Message
-import Language.LSP.Protocol.Types
+import Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Lens
 import Language.LSP.Server
 
@@ -42,6 +42,9 @@ import Agda.Compiler.Backend (setInteractionOutputCallback, resetState)
 import Agda.LSP.Translation
 import Agda.Interaction.Highlighting.JSON (jsonifyHighlightingInfo)
 import qualified Data.Aeson.KeyMap as KeyMap
+import qualified Agda.Utils.RangeMap as RangeMap
+import Agda.Interaction.Highlighting.Precise
+import Agda.Syntax.Position (noRange)
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -102,16 +105,6 @@ runAgdaLSP setup = do
 lspOutputCallback :: Uri -> LanguageContextEnv LspConfig -> InteractionOutputCallback
 lspOutputCallback uri config = liftIO . runLspT config . \case
   Resp_RunningInfo _ s -> lspDebug s
-  Resp_HighlightingInfo i rem method mod -> do
-    let
-      wrap toks = Object $ KeyMap.fromList
-        [ ("data", toks)
-        , ("uri", toJSON uri)
-        ]
-    sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/pushTokens"))
-      $ wrap
-      $ toJSON
-      $ aspectMapToTokens i
   _ -> pure ()
 
 lspInit
@@ -158,16 +151,17 @@ reloadUri uri = withIndefiniteProgress "Loading..." Nothing NotCancellable \prog
     , _diagnostics = []
     }
 
-  void $ workTCM uri \fp -> do
+  workTCM uri \fp -> do
     liftIO $ run $ progress "Resetting state"
     resetState
+
     liftIO $ run $ progress "Parsing source file"
     src <- parseSource fp
-    liftIO $ run $ progress "Type checking"
-    Imp.typeCheckMain Imp.TypeCheck src
 
-  sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/finishTokens"))
-    $ Object $ KeyMap.singleton "uri" (toJSON uri)
+    liftIO $ run $ progress "Type checking"
+    void $ Imp.typeCheckMain Imp.TypeCheck src
+
+    void $ liftIO $ run $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
 
 runTCMWorker :: Uri -> TCState -> TCM a -> WorkerM (a, TCState)
 runTCMWorker uri state cont = do
@@ -207,17 +201,31 @@ workTCM uri cont = do
       fp <- SourceFile <$> liftIO (absolute fp)
       (a, st) <- runTCMWorker uri state (cont fp)
 
-      lspDebug $ "Type checking action finished for file " <> show uri <> ", will release lock"
       liftIO $ putMVar lock st
-      lspDebug "lock released"
 
       pure a
 
     Nothing -> Prelude.error "TODO"
+
+provideSemanticTokens :: Handlers WorkerM
+provideSemanticTokens = requestHandler SMethod_TextDocumentSemanticTokensFull \req res -> withRunInIO \run -> run do
+  workTCM (req ^. params . textDocument . uri) \_ -> do
+    info <- useTC stSyntaxInfo
+    let tokens = aspectMapToTokens info
+    case encodeTokens agdaTokenLegend (relativizeTokens tokens) of
+      Left  e    -> liftIO $ run $ res $ Right (InR Lsp.Null)
+      Right ints -> liftIO $ run $ res $ Right $ InL (SemanticTokens Nothing ints)
+
+onInitialized :: Handlers WorkerM
+onInitialized = notificationHandler SMethod_Initialized \notif -> do
+  sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/highlightingInit"))
+    $ Object $ KeyMap.singleton "legend" (toJSON agdaTokenLegend)
 
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers _ = mconcat
   [ onTextDocumentOpen
   , onTextDocumentSaved
   , notificationHandler SMethod_TextDocumentDidChange (const (pure ()))
+  , provideSemanticTokens
+  , onInitialized
   ]

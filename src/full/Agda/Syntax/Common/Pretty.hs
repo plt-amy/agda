@@ -271,6 +271,7 @@ annotateAspect a = annotate a' where
     , note           = ""
     , definitionSite = Nothing
     , tokenBased     = TokenBased
+    , aspectRange    = noRange
     }
 
 -- * Syntax highlighting helpers
