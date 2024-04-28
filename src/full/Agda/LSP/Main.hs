@@ -131,7 +131,7 @@ onTextDocumentOpen = notificationHandler SMethod_TextDocumentDidOpen \notif -> d
     Just fp -> withRunInIO \run -> do
       let norm = toNormalizedUri theUri
 
-      lock <- liftIO $ newMVar initState
+      lock <- newMVar initState
       modifyMVar_ workers $ pure . HashMap.insert norm lock
 
       void . forkIO . run $ reloadUri theUri
@@ -142,6 +142,16 @@ onTextDocumentSaved :: Handlers WorkerM
 onTextDocumentSaved = notificationHandler SMethod_TextDocumentDidSave \notif -> do
   lspDebug $ "Document saved, will reload:" <> show (notif ^. params . textDocument . uri)
   reloadUri (notif ^. params . textDocument . uri)
+
+onTextDocumentClosed :: Handlers WorkerM
+onTextDocumentClosed = notificationHandler SMethod_TextDocumentDidClose \notif -> do
+  lspDebug $ "Document closed"
+  let theUri = notif ^. params . textDocument . uri
+  case uriToFilePath theUri of
+    Just fp -> do
+      workers <- asks lspStateWorkers
+      liftIO $ modifyMVar_ workers $ pure . HashMap.delete (toNormalizedUri theUri)
+    Nothing -> pure ()
 
 reloadUri :: Uri -> WorkerM ()
 reloadUri uri = withIndefiniteProgress "Loading..." Nothing NotCancellable \progress -> withRunInIO \run -> run do
@@ -225,7 +235,9 @@ lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers _ = mconcat
   [ onTextDocumentOpen
   , onTextDocumentSaved
+  , onTextDocumentClosed
   , notificationHandler SMethod_TextDocumentDidChange (const (pure ()))
+  , notificationHandler SMethod_WorkspaceDidChangeConfiguration (const (pure ()))
   , provideSemanticTokens
   , onInitialized
   ]
