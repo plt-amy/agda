@@ -28,6 +28,7 @@ import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.FileName (filePath)
 import Agda.Syntax.Abstract.Name (Name(nameBindingSite), qnameName)
 import Agda.LSP.Position (PosDelta, updatePosition)
+import Control.Monad (guard)
 
 class ToLsp a where
   type LspType a
@@ -137,17 +138,15 @@ aspectMapToTokens delta = concatMap go . RangeMap.toList where
     Just asp ->
       let
         tok ival = do
-          let
-            line = fromIntegral (posLine (iStart ival) - 1)
-            col  = fromIntegral (posCol (iStart ival) - 1)
-
-          Lsp.Position line col <- updatePosition delta (Lsp.Position line col)
+          Lsp.Position line col <- updatePosition delta (toLsp (iStart ival))
+          Lsp.Position line' col' <- updatePosition delta (toLsp (iEnd ival))
+          guard (line == line')
 
           pure Lsp.SemanticTokenAbsolute
             { _tokenType      = toLsp asp
             , _line           = line
             , _startChar      = col
-            , _length         = fromIntegral (posPos (iEnd ival) - posPos (iStart ival))
+            , _length         = col' - col
             , _tokenModifiers = []
             }
       in mapMaybe tok (rangeIntervals range)

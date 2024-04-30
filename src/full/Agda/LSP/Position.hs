@@ -116,3 +116,8 @@ updatePosition :: PosDelta -> Position -> Maybe Position
 updatePosition delta pos = case toDelta delta pos of
   ExactR r -> Just r
   _ -> Nothing
+
+downgradePosition :: PosDelta -> Position -> Maybe Position
+downgradePosition delta pos = case fromDelta delta pos of
+  ExactR r -> Just r
+  _ -> Nothing
