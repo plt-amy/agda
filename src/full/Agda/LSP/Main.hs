@@ -1,4 +1,6 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE RecursiveDo #-}
+{-# LANGUAGE ImplicitParams #-}
 module Agda.LSP.Main (runAgdaLSP) where
 
 import Control.Monad.IO.Class
@@ -15,6 +17,7 @@ import Data.HashMap.Strict (HashMap)
 import Data.Aeson.Types
 import Data.Default
 import Data.Proxy
+import Data.IORef
 
 import GHC.Generics
 
@@ -29,8 +32,8 @@ import Agda.TypeChecking.Monad.Base
 import Agda.Utils.Either (mapLeft)
 import Agda.Utils.Lens
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
-import Control.Exception (bracket)
-import Agda.TypeChecking.Monad.Debug (reportSDoc)
+import Control.Exception (bracket, evaluate)
+import Agda.TypeChecking.Monad.Debug (reportSDoc, reportSLn)
 import Agda.Interaction.Response.Base
 import Agda.Utils.FileName
 import System.IO
@@ -45,6 +48,13 @@ import qualified Data.Aeson.KeyMap as KeyMap
 import qualified Agda.Utils.RangeMap as RangeMap
 import Agda.Interaction.Highlighting.Precise
 import Agda.Syntax.Position (noRange)
+import Agda.LSP.Position (PosDelta, changeToDelta, updatePosition)
+import Agda.Interaction.Highlighting.Common (toAtoms)
+import Language.LSP.VFS (virtualFileText)
+import qualified Data.Text.Lazy as TL
+import Agda.Utils.Time (getCPUTime)
+import Agda.TypeChecking.Pretty (pretty)
+import Control.DeepSeq (NFData(rnf))
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -59,9 +69,29 @@ initLspConfig = LspConfig
   { lspHighlightingLevel = NonInteractive
   }
 
+data Worker = Worker
+  { workerUri  :: !NormalizedUri
+    -- ^ URI managed by this worker.
+
+  , workerFilePath :: FilePath
+    -- ^ File path managed by this worker.
+
+  , workerLoadedState :: !(MVar (IORef TCState))
+    -- ^ Mutable variable for the “main” TC state in this worker.
+
+  , workerThread      :: ThreadId
+    -- ^ Thread for this worker.
+
+  , workerTasks       :: Chan (Worker -> TCM ())
+
+  , workerContext     :: LanguageContextEnv LspConfig
+
+  , workerPosDelta    :: !(MVar PosDelta)
+  }
+
 data LspState = LspState
   { lspStateConfig  :: LanguageContextEnv LspConfig
-  , lspStateWorkers :: MVar (HashMap NormalizedUri (MVar TCState))
+  , lspStateWorkers :: MVar (HashMap NormalizedUri Worker)
   , lspStateSetup   :: TCM ()
   }
 
@@ -86,7 +116,7 @@ runAgdaLSP setup = do
     hSetBuffering stdout NoBuffering
     hSetBuffering stdin NoBuffering
 
-  exc <- liftIO $ runServer ServerDefinition
+  exc <- liftIO $ runServerWithHandles mempty mempty stdin stdout ServerDefinition
     { defaultConfig    = initLspConfig
     , configSection    = "agda"
     , parseConfig      = \_ -> mapLeft Text.pack . parseEither parseJSON
@@ -98,6 +128,7 @@ runAgdaLSP setup = do
       { optTextDocumentSync = Just syncOptions
       }
     }
+
   liftIO case exc of
     0 -> exitSuccess
     n -> exitWith (ExitFailure n)
@@ -114,6 +145,7 @@ lspInit
   -> IO (Either ResponseError LspState)
 lspInit setup config _ = do
   workers  <- newMVar mempty
+
   pure $ Right LspState
     { lspStateConfig  = config
     , lspStateWorkers = workers
@@ -123,108 +155,138 @@ lspInit setup config _ = do
 lspDebug :: MonadLsp cfg m => String -> m ()
 lspDebug s = sendNotification SMethod_WindowLogMessage (LogMessageParams MessageType_Log (Text.pack s))
 
+spawnOrGet :: Uri -> WorkerM Worker
+spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
+  Just fp -> do
+    state <- run ask
+    let norm = toNormalizedUri uri
+    modifyMVar (lspStateWorkers state) \workers -> case HashMap.lookup norm workers of
+      Just worker -> pure (workers, worker)
+
+      Nothing -> do
+        lock   <- newMVar =<< newIORef initState
+        deltas <- newMVar mempty
+        chan   <- newChan
+
+        rec
+          wthread <- forkIO . forever $ do
+            task <- readChan chan
+
+            let
+              report :: TCErr -> TCM ()
+              report terr = do
+                diag <- errorToDiagnostic terr
+                liftIO . run $
+                  sendNotification SMethod_TextDocumentPublishDiagnostics $ PublishDiagnosticsParams
+                    { _uri         = uri
+                    , _version     = Nothing
+                    , _diagnostics = diag
+                    }
+
+              task' = do
+                lspStateSetup state
+                setInteractionOutputCallback (lspOutputCallback uri (lspStateConfig state))
+                conf <- liftIO (run getConfig)
+                locallyTC eHighlightingLevel (const (lspHighlightingLevel conf)) do
+                  task worker `catchError` report
+
+            withMVar lock \state -> do
+              unTCM task' state initEnv
+
+          let
+            worker = Worker
+              { workerUri         = norm
+              , workerFilePath    = fp
+              , workerLoadedState = lock
+              , workerThread      = wthread
+              , workerTasks       = chan
+              , workerContext     = lspStateConfig state
+              , workerPosDelta    = deltas
+              }
+
+        run $ lspDebug $ "Spawned worker " <> show (workerThread worker) <> " to manage file " <> fp
+        pure (HashMap.insert norm worker workers, worker)
+
+  Nothing -> Prelude.error "TODO"
+
+type Task = (?worker :: Worker) => TCM ()
+
+runAtURI :: Uri -> Task -> WorkerM ()
+runAtURI uri task = do
+  Worker{workerTasks = chan} <- spawnOrGet uri
+  liftIO $ writeChan chan (\worker -> let ?worker = worker in task)
+
 onTextDocumentOpen :: Handlers WorkerM
-onTextDocumentOpen = notificationHandler SMethod_TextDocumentDidOpen \notif -> do
-  workers <- asks lspStateWorkers
-  let theUri = notif ^. params . textDocument . uri
-  case uriToFilePath theUri of
-    Just fp -> withRunInIO \run -> do
-      let norm = toNormalizedUri theUri
-
-      lock <- newMVar initState
-      modifyMVar_ workers $ pure . HashMap.insert norm lock
-
-      void . forkIO . run $ reloadUri theUri
-
-    Nothing -> lspDebug $ "Refusing to load non-file:// URI " <> show theUri
+onTextDocumentOpen = notificationHandler SMethod_TextDocumentDidOpen \notif ->
+  runAtURI (notif ^. params . textDocument . uri) do
+  reportSLn "lsp.lifecycle" 10 "document opened"
+  reloadURI
 
 onTextDocumentSaved :: Handlers WorkerM
-onTextDocumentSaved = notificationHandler SMethod_TextDocumentDidSave \notif -> do
-  lspDebug $ "Document saved, will reload:" <> show (notif ^. params . textDocument . uri)
-  reloadUri (notif ^. params . textDocument . uri)
+onTextDocumentSaved = notificationHandler SMethod_TextDocumentDidSave \notif ->
+  runAtURI (notif ^. params . textDocument . uri) do reloadURI
 
-onTextDocumentClosed :: Handlers WorkerM
-onTextDocumentClosed = notificationHandler SMethod_TextDocumentDidClose \notif -> do
-  lspDebug $ "Document closed"
-  let theUri = notif ^. params . textDocument . uri
-  case uriToFilePath theUri of
-    Just fp -> do
-      workers <- asks lspStateWorkers
-      liftIO $ modifyMVar_ workers $ pure . HashMap.delete (toNormalizedUri theUri)
-    Nothing -> pure ()
+onTextDocumentChange :: Handlers WorkerM
+onTextDocumentChange = notificationHandler SMethod_TextDocumentDidChange \notif ->
+  runAtURI (notif ^. params . textDocument . uri) do
+  reportSLn "lsp.lifecycle" 10 "document changed"
 
-reloadUri :: Uri -> WorkerM ()
-reloadUri uri = withIndefiniteProgress "Loading..." Nothing NotCancellable \progress -> withRunInIO \run -> run do
-  sendNotification SMethod_TextDocumentPublishDiagnostics $ PublishDiagnosticsParams
-    { _uri         = uri
-    , _version     = Nothing
-    , _diagnostics = []
-    }
+  liftIO $ modifyMVar_ (workerPosDelta ?worker) \old -> do
+    let new = foldMap changeToDelta (notif ^. params . contentChanges)
+    -- Important: mappend for PosDelta is *applicative order*, so this
+    -- means "first apply the old diff, then apply the new diff".
+    new `seq` pure (new <> old)
 
-  workTCM uri \fp -> do
-    liftIO $ run $ progress "Resetting state"
-    resetState
+notifyTCM
+  :: forall (m :: Method 'ServerToClient 'Notification). (?worker :: Worker)
+  => SServerMethod m -> MessageParams m -> TCM ()
+notifyTCM notif param = liftIO . runLspT (workerContext ?worker) $ sendNotification notif param
 
-    liftIO $ run $ progress "Parsing source file"
-    src <- parseSource fp
+requestTCM
+  :: forall (m :: Method 'ServerToClient 'Request). (?worker :: Worker)
+  => SServerMethod m -> MessageParams m -> (Either ResponseError (MessageResult m) -> Task) -> TCM ()
+requestTCM notif param handle = liftIO . runLspT (workerContext ?worker) $ void $
+  sendRequest notif param \resp -> liftIO do
+    writeChan (workerTasks ?worker) (\worker -> let ?worker = worker in handle resp)
 
-    liftIO $ run $ progress "Type checking"
-    void $ Imp.typeCheckMain Imp.TypeCheck src
+diagnoseTCM :: (?worker :: Worker) => [Diagnostic] -> TCM ()
+diagnoseTCM diag = notifyTCM SMethod_TextDocumentPublishDiagnostics $ PublishDiagnosticsParams
+  { _uri         = fromNormalizedUri (workerUri ?worker)
+  , _version     = Nothing
+  , _diagnostics = diag
+  }
 
-    void $ liftIO $ run $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
+reloadURI :: Task
+reloadURI = do
+  resetState
+  liftIO $ modifyMVar_ (workerPosDelta ?worker) \_ -> pure mempty
+  diagnoseTCM []
 
-runTCMWorker :: Uri -> TCState -> TCM a -> WorkerM (a, TCState)
-runTCMWorker uri state cont = do
-  setup <- asks lspStateSetup
-  ctx <- asks lspStateConfig
-  conf <- getConfig
+  sf <- SourceFile <$> liftIO (absolute (workerFilePath ?worker))
+  src <- parseSource sf
+  void $ Imp.typeCheckMain Imp.TypeCheck src
+  requestTCM SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
 
-  let
-    wrap = locallyTC eHighlightingLevel (const (lspHighlightingLevel conf))
-
-  (res, state') <- liftIO $ runTCM initEnv state do
-    setup
-    setInteractionOutputCallback (lspOutputCallback uri ctx)
-    tryError (wrap cont) >>= \case
-      Left err -> Left <$> errorToDiagnostic err
-      Right x -> pure (Right x)
-
-  case res of
-    Left err -> do
-      sendNotification SMethod_TextDocumentPublishDiagnostics $ PublishDiagnosticsParams
-        { _uri         = uri
-        , _version     = Nothing
-        , _diagnostics = err
-        }
-      pure (undefined, state')
-    Right x -> pure (x, state')
-
-workTCM :: Uri -> (SourceFile -> TCM a) -> WorkerM a
-workTCM uri cont = do
-  let norm = toNormalizedUri uri
-  locks <- asks lspStateWorkers
-  lock <- (=<<) (HashMap.lookup norm) <$> liftIO (tryReadMVar locks)
-
-  case (,) <$> lock <*> uriToFilePath uri of
-    Just (lock, fp) -> do
-      state <- liftIO $ takeMVar lock
-      fp <- SourceFile <$> liftIO (absolute fp)
-      (a, st) <- runTCMWorker uri state (cont fp)
-
-      liftIO $ putMVar lock st
-
-      pure a
-
-    Nothing -> Prelude.error "TODO"
+requestHandlerTCM
+  :: forall (m :: Method 'ClientToServer 'Request). SMethod m
+  -> (TRequestMessage m -> Uri)
+  -> (TRequestMessage m -> (Either ResponseError (MessageResult m) -> TCM ()) -> Task)
+  -> Handlers WorkerM
+requestHandlerTCM method uri cont = requestHandler method \req res -> withRunInIO \run -> run do
+  runAtURI (uri req) $ cont req \m -> liftIO (run (res m))
 
 provideSemanticTokens :: Handlers WorkerM
-provideSemanticTokens = requestHandler SMethod_TextDocumentSemanticTokensFull \req res -> withRunInIO \run -> run do
-  workTCM (req ^. params . textDocument . uri) \_ -> do
-    info <- useTC stSyntaxInfo
-    let tokens = aspectMapToTokens info
-    case encodeTokens agdaTokenLegend (relativizeTokens tokens) of
-      Left  e    -> liftIO $ run $ res $ Right (InR Lsp.Null)
-      Right ints -> liftIO $ run $ res $ Right $ InL (SemanticTokens Nothing ints)
+provideSemanticTokens =
+  requestHandlerTCM SMethod_TextDocumentSemanticTokensFull (view (params . textDocument . uri)) \req res -> do
+  info <- useTC stSyntaxInfo
+
+  delta <- liftIO $ readMVar (workerPosDelta ?worker)
+  let tokens = aspectMapToTokens delta info
+  reportSLn "lsp.highlighting.semantic" 10 "returning semantic tokens"
+
+  case encodeTokens agdaTokenLegend (relativizeTokens tokens) of
+    Left  e    -> res $ Right (InR Lsp.Null)
+    Right ints -> res $ Right $ InL (SemanticTokens Nothing ints)
 
 onInitialized :: Handlers WorkerM
 onInitialized = notificationHandler SMethod_Initialized \notif -> do
@@ -235,9 +297,12 @@ lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers _ = mconcat
   [ onTextDocumentOpen
   , onTextDocumentSaved
-  , onTextDocumentClosed
-  , notificationHandler SMethod_TextDocumentDidChange (const (pure ()))
+  -- , onTextDocumentClosed
+  , onInitialized
+  , onTextDocumentChange
   , notificationHandler SMethod_WorkspaceDidChangeConfiguration (const (pure ()))
   , provideSemanticTokens
-  , onInitialized
   ]
+  -- , provideSemanticTokens
+  -- , onInitialized
+  -- ]
