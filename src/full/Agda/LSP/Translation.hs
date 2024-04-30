@@ -27,6 +27,7 @@ import Agda.Syntax.Common.Aspect as Asp
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.FileName (filePath)
 import Agda.Syntax.Abstract.Name (Name(nameBindingSite), qnameName)
+import Agda.LSP.Position (PosDelta, updatePosition)
 
 class ToLsp a where
   type LspType a
@@ -130,19 +131,26 @@ agdaTokenLegend = Lsp.SemanticTokensLegend
   , _tokenModifiers = []
   }
 
-aspectMapToTokens :: RangeMap Aspects -> [Lsp.SemanticTokenAbsolute]
-aspectMapToTokens = concatMap go . RangeMap.toList where
+aspectMapToTokens :: PosDelta -> RangeMap Aspects -> [Lsp.SemanticTokenAbsolute]
+aspectMapToTokens delta = concatMap go . RangeMap.toList where
   go (_, asp@Aspects{aspectRange = range}) = case aspect asp of
     Just asp ->
       let
-        tok ival = Lsp.SemanticTokenAbsolute
-          { _tokenType      = toLsp asp
-          , _line           = fromIntegral (posLine (iStart ival) - 1)
-          , _startChar      = fromIntegral (posCol (iStart ival) - 1)
-          , _length         = fromIntegral (posPos (iEnd ival) - posPos (iStart ival))
-          , _tokenModifiers = []
-          }
-      in map tok (rangeIntervals range)
+        tok ival = do
+          let
+            line = fromIntegral (posLine (iStart ival) - 1)
+            col  = fromIntegral (posCol (iStart ival) - 1)
+
+          Lsp.Position line col <- updatePosition delta (Lsp.Position line col)
+
+          pure Lsp.SemanticTokenAbsolute
+            { _tokenType      = toLsp asp
+            , _line           = line
+            , _startChar      = col
+            , _length         = fromIntegral (posPos (iEnd ival) - posPos (iStart ival))
+            , _tokenModifiers = []
+            }
+      in mapMaybe tok (rangeIntervals range)
       -- Just OffsetToken
       -- { tokenStart     = start
       -- , tokenEnd       = end

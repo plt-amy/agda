@@ -463,6 +463,7 @@ library
     , lsp-types            >= 2.1.0.0   && < 2.2
     , unliftio-core        >= 0.2       && < 0.3
     , data-default         >= 0.7       && < 0.8
+    , row-types            >= 1.0       && < 1.1
 
   -- We don't write upper bounds for Alex nor Happy because the
   -- `build-tool-depends` field can not be modified in Hackage.
@@ -545,6 +546,7 @@ library
       Agda.Interaction.Options.Lenses
       Agda.Interaction.Options.Warnings
       Agda.LSP.Main
+      Agda.LSP.Position
       Agda.LSP.Translation
       Agda.Main
       Agda.Mimer.Mimer
