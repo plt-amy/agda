@@ -74,7 +74,7 @@ import Agda.TypeChecking.Telescope (flattenTel, telView)
 import Agda.Syntax.Scope.Base (namesInScope, allNamesInScope, scopeInScope)
 import qualified Data.Set as Set
 import Control.Monad.Trans.Maybe (MaybeT(runMaybeT))
-import Agda.TypeChecking.Substitute (TelV(TelV))
+import Agda.TypeChecking.Substitute (TelV(TelV), raise)
 import Agda.TypeChecking.Reduce (reduceB, reduce)
 import qualified Agda.Syntax.Concrete.Name as C
 import Agda.Syntax.Translation.AbstractToConcrete (abstractToConcrete_)
@@ -406,9 +406,9 @@ goal = requestHandler (SMethod_CustomMethod (Proxy :: Proxy "agda/interactionPoi
         _ -> liftIO . run . res $ Right $ Aeson.Null
     Aeson.Error _ -> pure ()
 
-localCompletionItem :: (Int, Dom' Term (Name, Type)) -> TCM (Maybe CompletionItem)
-localCompletionItem (ix, var@Dom{unDom = (name, ty)}) = runMaybeT do
-  ty <- Text.pack . Ppr.render <$> lift (prettyATop =<< reify (unEl ty))
+localCompletionItem :: Int -> Dom' Term (Name, Type) -> TCM (Maybe CompletionItem)
+localCompletionItem ix var@Dom{unDom = (name, ty)} = runMaybeT do
+  ty <- Text.pack . Ppr.render <$> lift (prettyATop =<< reify (unEl (raise (ix + 1) ty)))
 
   concrete <- lift (abstractToConcrete_ name)
   guard (C.InScope == C.isInScope concrete)
@@ -500,8 +500,9 @@ completion :: Handlers WorkerM
 completion = requestHandlerTCM SMethod_TextDocumentCompletion (view (params . textDocument . uri)) \req res ->
   void $ withPosition (req ^. params . position) \ip -> do
     ctx  <- getContext
-    comp  <- traverse localCompletionItem (zip [0..] ctx)
-    want <- traverse getMetaTypeInContext (ipMeta ip)
+    comp <- traverse (uncurry localCompletionItem) (zip [0..] ctx)
+
+    want  <- traverse getMetaTypeInContext (ipMeta ip)
     comp' <- traverse (definedCompletionItem want) . Set.toList =<< fmap (^. scopeInScope) getScope
 
     reportSLn "lsp.completion" 10 $ show req
