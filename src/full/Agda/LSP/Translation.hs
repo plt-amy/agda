@@ -45,7 +45,7 @@ instance ToLsp (Interval' a) where
 instance ToLsp (Range' a) where
   type LspType (Range' a) = Lsp.Range
   toLsp = \case
-    NoRange -> __IMPOSSIBLE__
+    NoRange -> Lsp.Range (Lsp.Position 0 0) (Lsp.Position 0 0) -- TODO
 
     -- TODO: Agda has non-contiguous ranges but LSP just wants a start
     -- and end position.
@@ -134,7 +134,8 @@ agdaTokenLegend = Lsp.SemanticTokensLegend
 
 aspectMapToTokens :: PosDelta -> RangeMap Aspects -> [Lsp.SemanticTokenAbsolute]
 aspectMapToTokens delta = concatMap go . RangeMap.toList where
-  go (_, asp@Aspects{aspectRange = range}) = case aspect asp of
+  go (_, asp@Aspects{aspectRange = range}) | range /= noRange = case aspect asp of
+    Just Symbol -> []
     Just asp ->
       let
         tok ival = do
@@ -157,3 +158,4 @@ aspectMapToTokens delta = concatMap go . RangeMap.toList where
       -- , tokenSyntactic = tokenBased aspects == TokenBased
       -- }
     _ -> []
+  go _ = []

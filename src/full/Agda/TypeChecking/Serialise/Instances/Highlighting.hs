@@ -13,7 +13,7 @@ import qualified Agda.Interaction.Highlighting.Precise as HP
 import qualified Agda.Utils.RangeMap                   as RM
 
 import Agda.TypeChecking.Serialise.Base
-import Agda.TypeChecking.Serialise.Instances.Common () --instance only
+import Agda.TypeChecking.Serialise.Instances.Common (SerialisedRange(SerialisedRange, underlyingRange)) --instance only
 
 instance EmbPrj HR.Range where
   icod_ (HR.Range a b) = icodeN' HR.Range a b
@@ -112,9 +112,9 @@ instance EmbPrj HP.OtherAspect where
     _  -> malformed
 
 instance EmbPrj HP.Aspects where
-  icod_ (HP.Aspects a b c d e r) = icodeN' HP.Aspects a b c d e r
+  icod_ (HP.Aspects a b c d e f) = icodeN' (\a b c d e f -> HP.Aspects a b c d (underlyingRange e) f) a b c d (SerialisedRange e) f
 
-  value = valueN HP.Aspects
+  value = valueN \a b c d e f -> HP.Aspects a b c d (underlyingRange e) f
 
 instance EmbPrj HP.DefinitionSite where
   icod_ (HP.DefinitionSite a b c d) = icodeN' HP.DefinitionSite a b c d
