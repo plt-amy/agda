@@ -24,6 +24,7 @@ import qualified Data.Set as Set
 import Data.HashMap.Strict (HashMap)
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Aeson.Types as Aeson
+import Data.Foldable
 import Data.Default
 import Data.Proxy
 import Data.IORef
@@ -264,6 +265,19 @@ onTextDocumentChange = notificationHandler SMethod_TextDocumentDidChange \notif 
     -- Important: mappend for PosDelta is *applicative order*, so this
     -- means "first apply the old diff, then apply the new diff".
     new `seq` pure (new <> old)
+
+onTextDocumentClosed :: Handlers WorkerM
+onTextDocumentClosed = notificationHandler SMethod_TextDocumentDidClose \notif ->
+  withRunInIO \run -> do
+    let uri' = notif ^. params . textDocument . uri
+    case uriToFilePath uri' of
+      Just fp -> do
+        state <- run ask
+        let norm = toNormalizedUri uri'
+        worker <- modifyMVar (lspStateWorkers state) \workers -> pure (HashMap.delete norm workers, HashMap.lookup norm workers)
+        traverse_ (killThread . workerThread) worker
+
+      Nothing -> pure ()
 
 notifyTCM
   :: forall (m :: Method 'ServerToClient 'Notification). (?worker :: Worker)
@@ -540,7 +554,7 @@ lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers _ = mconcat
   [ onTextDocumentOpen
   , onTextDocumentSaved
-  -- , onTextDocumentClosed
+  , onTextDocumentClosed
   , onInitialized
   , onTextDocumentChange
   , notificationHandler SMethod_WorkspaceDidChangeConfiguration (const (pure ()))
@@ -549,6 +563,3 @@ lspHandlers _ = mconcat
   , Agda.LSP.Main.completion
   -- , Agda.LSP.Main.onTypeFormatting
   ]
-  -- , provideSemanticTokens
-  -- , onInitialized
-  -- ]
