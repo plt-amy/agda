@@ -43,7 +43,7 @@ import qualified Agda.Interaction.Imports as Imp
 import Agda.Interaction.Imports (parseSource)
 import Data.Coerce (coerce)
 import Agda.Interaction.FindFile (SourceFile(SourceFile))
-import Agda.Compiler.Backend (setInteractionOutputCallback, resetState, getInteractionPoints, metaType, withMetaId, getMetaTypeInContext, withInteractionId, getContextTelescope, getContextNames, typeOfBV, nameOfBV, getContextSize, getScope, HasConstInfo (getConstInfo), inTopContext, AddContext (addContext))
+import Agda.Compiler.Backend (setInteractionOutputCallback, resetState, getInteractionPoints, metaType, withMetaId, getMetaTypeInContext, withInteractionId, getContextTelescope, getContextNames, typeOfBV, nameOfBV, getContextSize, getScope, HasConstInfo (getConstInfo), inTopContext, AddContext (addContext), getContext)
 import Agda.LSP.Translation
 import Agda.Interaction.Highlighting.JSON (jsonifyHighlightingInfo)
 import qualified Data.Aeson.KeyMap as KeyMap
@@ -62,7 +62,7 @@ import Agda.Syntax.Concrete (Module(modDecls))
 import qualified Agda.Utils.BiMap as BiMap
 import qualified Data.Map as Map
 import qualified Data.Aeson as Aeson
-import Data.List (find)
+import Data.List (find, sortOn)
 import Data.Maybe (isJust, mapMaybe, listToMaybe, catMaybes)
 import Agda.Interaction.JSONTop
 import qualified Text.PrettyPrint.Annotated.HughesPJ as Ppr
@@ -75,7 +75,11 @@ import Agda.Syntax.Scope.Base (namesInScope, allNamesInScope, scopeInScope)
 import qualified Data.Set as Set
 import Control.Monad.Trans.Maybe (MaybeT(runMaybeT))
 import Agda.TypeChecking.Substitute (TelV(TelV))
-import Agda.TypeChecking.Reduce (reduceB)
+import Agda.TypeChecking.Reduce (reduceB, reduce)
+import qualified Agda.Syntax.Concrete.Name as C
+import Agda.Syntax.Translation.AbstractToConcrete (abstractToConcrete_)
+import Agda.Syntax.Abstract.Pretty (prettyATop)
+import Agda.Syntax.Translation.InternalToAbstract (Reify(reify))
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -350,9 +354,9 @@ provideSemanticTokens =
 
   delta <- liftIO $ readMVar (workerPosDelta ?worker)
   let tokens = aspectMapToTokens delta info
-  reportSLn "lsp.highlighting.semantic" 10 "returning semantic tokens"
+  reportSLn "lsp.highlighting.semantic" 10 $ "returning " <> show (Prelude.length tokens) <> " semantic tokens"
 
-  case encodeTokens agdaTokenLegend (relativizeTokens tokens) of
+  case encodeTokens agdaTokenLegend (relativizeTokens (sortOn (\x -> (x ^. line, x ^. startChar)) tokens)) of
     Left  e    -> res $ Right (InR Lsp.Null)
     Right ints -> res $ Right $ InL (SemanticTokens Nothing ints)
 
@@ -402,13 +406,18 @@ goal = requestHandler (SMethod_CustomMethod (Proxy :: Proxy "agda/interactionPoi
         _ -> liftIO . run . res $ Right $ Aeson.Null
     Aeson.Error _ -> pure ()
 
-localCompletionItem :: Int -> TCM CompletionItem
-localCompletionItem var = do
-  ty <- Text.pack . Ppr.render <$> (prettyTCM =<< typeOfBV var)
-  name <- Text.pack . Ppr.render <$> (prettyTCM =<< nameOfBV var)
+localCompletionItem :: (Int, Dom' Term (Name, Type)) -> TCM (Maybe CompletionItem)
+localCompletionItem (ix, var@Dom{unDom = (name, ty)}) = runMaybeT do
+  ty <- Text.pack . Ppr.render <$> lift (prettyATop =<< reify (unEl ty))
+
+  concrete <- lift (abstractToConcrete_ name)
+  guard (C.InScope == C.isInScope concrete)
+
+  name <- Text.pack . Ppr.render <$> lift (prettyTCM name)
+
   pure CompletionItem
     { _textEditText        = Nothing
-    , _sortText            = Nothing
+    , _sortText            = Just ("00_" <> Text.pack (show ix))
     , _preselect           = Nothing
     , _labelDetails        = Just (CompletionItemLabelDetails (Just (" : " <> ty)) Nothing)
     , _insertTextFormat    = Nothing
@@ -433,35 +442,43 @@ headMatches Nothing _ = pure True
 headMatches (Just t) t' = do
   TelV ctx t' <- telView t'
   t' <- fmap unEl <$> reduceB t'
-  case (ignoreBlocking t', t) of
-    (Var{}, _) -> pure True
+  t <- reduce t
+  case (ignoreBlocking t', unEl t) of
+    (Var{}, _)   -> pure True
+    (_, MetaV{}) -> pure True
+    (MetaV{}, _) -> pure True
     (Def q _, _)
       | Blocked{} <- t'    -> pure True
       | Def q' _ <- unEl t -> pure $! q == q'
+    (Sort{},  Sort{})  -> pure True
+    (Level{}, Level{}) -> pure True
     _ -> pure False
 
 definedCompletionItem :: Maybe Type -> QName -> TCM (Maybe CompletionItem)
+definedCompletionItem _ qnm | isExtendedLambdaName qnm = pure Nothing
+definedCompletionItem _ qnm | isAbsurdLambdaName qnm = pure Nothing
 definedCompletionItem want qnm = getConstInfo qnm >>= \def -> runMaybeT do
   name <- Text.pack . Ppr.render <$> lift (prettyTCM qnm)
 
   let
     kind = case theDef def of
-      Axiom{}         -> Just CompletionItemKind_Constant
-      I.Datatype{}    -> Just CompletionItemKind_Enum
-      I.Record{}      -> Just CompletionItemKind_Struct
-      I.Function{}    -> Just CompletionItemKind_Function
-      I.Primitive{}   -> Just CompletionItemKind_Function
-      I.Constructor{} -> Just CompletionItemKind_EnumMember
-      _               -> Nothing
+      Axiom{}                             -> Just CompletionItemKind_Constant
+      I.Datatype{}                        -> Just CompletionItemKind_Enum
+      I.Record{}                          -> Just CompletionItemKind_Struct
+      I.Function{funProjection = Right _} -> Just CompletionItemKind_Field
+      I.Function{}                        -> Just CompletionItemKind_Function
+      I.Primitive{}                       -> Just CompletionItemKind_Function
+      I.Constructor{}                     -> Just CompletionItemKind_EnumMember
+      _                                   -> Nothing
 
   guard =<< lift (headMatches want (defType def))
-  ty <- Text.pack . Ppr.render <$> lift (prettyTCM (defType def))
+  ty <- Text.pack . Ppr.render <$> lift (inTopContext (prettyATop =<< reify (defType def)))
 
   pure CompletionItem
     { _textEditText        = Nothing
     , _sortText            = Nothing
     , _preselect           = Nothing
-    , _labelDetails        = Just (CompletionItemLabelDetails (Just (" : " <> ty)) Nothing)
+    , _labelDetails        = Just (CompletionItemLabelDetails Nothing (Just (" : " <> ty)))
     , _insertTextFormat    = Nothing
     , _insertText          = Nothing
     , _filterText          = Nothing
@@ -482,13 +499,13 @@ definedCompletionItem want qnm = getConstInfo qnm >>= \def -> runMaybeT do
 completion :: Handlers WorkerM
 completion = requestHandlerTCM SMethod_TextDocumentCompletion (view (params . textDocument . uri)) \req res ->
   void $ withPosition (req ^. params . position) \ip -> do
-    size  <- getContextSize
-    comp  <- traverse localCompletionItem [0..size - 1]
+    ctx  <- getContext
+    comp  <- traverse localCompletionItem (zip [0..] ctx)
     want <- traverse getMetaTypeInContext (ipMeta ip)
     comp' <- traverse (definedCompletionItem want) . Set.toList =<< fmap (^. scopeInScope) getScope
 
     reportSLn "lsp.completion" 10 $ show req
-    res (Right (InL (comp ++ catMaybes comp')))
+    res (Right (InL (catMaybes comp ++ catMaybes comp')))
 
 rangeContains :: PosDelta -> Position -> Range' a -> Bool
 rangeContains delta (Position linum colnum) rng = any go (rangeIntervals rng) where
