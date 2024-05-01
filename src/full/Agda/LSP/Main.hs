@@ -2,24 +2,34 @@
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE NondecreasingIndentation #-}
 module Agda.LSP.Main (runAgdaLSP) where
 
+import Control.Monad.Trans.Maybe
 import Control.Monad.IO.Class
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
 import Control.Monad.Except
+import Control.Concurrent
+import Control.Exception
 import Control.Monad
 
-import Control.Concurrent
-
 import qualified Data.HashMap.Strict as HashMap
+import qualified Data.Aeson.KeyMap as KeyMap
+import qualified Data.Text.Lazy as TL
 import qualified Data.Text as Text
+import qualified Data.Map as Map
+import qualified Data.Set as Set
+
 import Data.HashMap.Strict (HashMap)
-import Data.Aeson.Types
+import Data.List.NonEmpty (NonEmpty(..))
+import Data.Aeson.Types as Aeson
 import Data.Default
 import Data.Proxy
-import Data.List.NonEmpty (NonEmpty(..))
 import Data.IORef
+import Data.Coerce
+import Data.Maybe
+import Data.List (find, sortOn)
 
 import GHC.Generics
 
@@ -27,59 +37,50 @@ import Language.LSP.Protocol.Message
 import Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Lens
 import Language.LSP.Server
+import Language.LSP.VFS (virtualFileText)
 
 import System.Exit
-
-import Agda.TypeChecking.Monad.Base as I
-import Agda.Utils.Either (mapLeft)
-import Agda.Utils.Lens
-import Agda.Utils.Impossible (__IMPOSSIBLE__)
-import Control.Exception (bracket, evaluate, SomeException (SomeException), catch)
-import Agda.TypeChecking.Monad.Debug (reportSDoc, reportSLn)
-import Agda.Interaction.Response.Base
-import Agda.Utils.FileName
 import System.IO
-import qualified Agda.Interaction.Imports as Imp
-import Agda.Interaction.Imports (parseSource)
-import Data.Coerce (coerce)
-import Agda.Interaction.FindFile (SourceFile(SourceFile))
-import Agda.Compiler.Backend (setInteractionOutputCallback, resetState, getInteractionPoints, metaType, withMetaId, getMetaTypeInContext, withInteractionId, getContextTelescope, getContextNames, typeOfBV, nameOfBV, getContextSize, getScope, HasConstInfo (getConstInfo), inTopContext, AddContext (addContext), getContext)
-import Agda.LSP.Translation
-import Agda.Interaction.Highlighting.JSON (jsonifyHighlightingInfo)
-import qualified Data.Aeson.KeyMap as KeyMap
-import qualified Agda.Utils.RangeMap as RangeMap
-import Agda.Interaction.Highlighting.Precise
-import Agda.Syntax.Position (noRange, rangeToInterval, Position' (posPos, posLine, posCol), Interval' (iEnd, iStart), rangeIntervals, Range')
-import Agda.LSP.Position (PosDelta, changeToDelta, updatePosition, downgradePosition)
-import Agda.Interaction.Highlighting.Common (toAtoms)
-import Language.LSP.VFS (virtualFileText)
-import qualified Data.Text.Lazy as TL
-import Agda.Utils.Time (getCPUTime)
-import Agda.TypeChecking.Pretty
-import Control.DeepSeq (NFData(rnf))
-import Agda.Syntax.Concrete.Pretty
-import Agda.Syntax.Concrete (Module(modDecls))
-import qualified Agda.Utils.BiMap as BiMap
-import qualified Data.Map as Map
-import qualified Data.Aeson as Aeson
-import Data.List (find, sortOn)
-import Data.Maybe (isJust, mapMaybe, listToMaybe, catMaybes)
-import Agda.Interaction.JSONTop
+
 import qualified Text.PrettyPrint.Annotated.HughesPJ as Ppr
 import qualified Text.PrettyPrint.Annotated as Ppr
-import qualified Agda.Syntax.Position as Agda
-import Agda.Interaction.BasicOps (getWarningsAndNonFatalErrors)
-import Agda.Syntax.Internal
-import Agda.TypeChecking.Telescope (flattenTel, telView)
-import Agda.Syntax.Scope.Base (namesInScope, allNamesInScope, scopeInScope)
-import qualified Data.Set as Set
-import Control.Monad.Trans.Maybe (MaybeT(runMaybeT))
-import Agda.TypeChecking.Substitute (TelV(TelV), raise)
-import Agda.TypeChecking.Reduce (reduceB, reduce)
+
 import qualified Agda.Syntax.Concrete.Name as C
-import Agda.Syntax.Translation.AbstractToConcrete (abstractToConcrete_)
-import Agda.Syntax.Abstract.Pretty (prettyATop)
+import qualified Agda.Syntax.Position as Agda
+
 import Agda.Syntax.Translation.InternalToAbstract (Reify(reify))
+import Agda.Syntax.Translation.AbstractToConcrete
+import Agda.Syntax.Abstract.Pretty
+import Agda.Syntax.Concrete.Pretty () -- Instances only
+import Agda.Syntax.Scope.Base
+import Agda.Syntax.Concrete (Module(modDecls))
+import Agda.Syntax.Position
+import Agda.Syntax.Internal
+
+import Agda.TypeChecking.Substitute
+import Agda.TypeChecking.Telescope
+import Agda.TypeChecking.Pretty
+import Agda.TypeChecking.Reduce
+import Agda.TypeChecking.Monad as I
+
+import Agda.LSP.Translation
+import Agda.LSP.Position
+
+import qualified Agda.Interaction.Imports as Imp
+import Agda.Interaction.Highlighting.Precise
+import Agda.Interaction.Highlighting.Common (toAtoms)
+import Agda.Interaction.Response.Base
+import Agda.Interaction.FindFile (SourceFile(SourceFile))
+import Agda.Interaction.BasicOps (getWarningsAndNonFatalErrors)
+import Agda.Interaction.JSONTop () -- Instances only
+
+import qualified Agda.Utils.RangeMap as RangeMap
+import qualified Agda.Utils.BiMap as BiMap
+
+import Agda.Utils.Impossible
+import Agda.Utils.FileName
+import Agda.Utils.Either
+import Agda.Utils.Lens
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -305,7 +306,7 @@ reloadURI = do
   diagnoseTCM []
 
   sf <- SourceFile <$> liftIO (absolute (workerFilePath ?worker))
-  src <- parseSource sf
+  src <- Imp.parseSource sf
   cr <- Imp.typeCheckMain Imp.TypeCheck src
   requestTCM SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
 
@@ -340,12 +341,12 @@ isQuestion InteractionPoint{ipRange = r}
 isQuestion _ = False
 
 requestHandlerTCM
-  :: forall (m :: Method 'ClientToServer 'Request). SMethod m
+  :: forall (m :: Method 'ClientToServer 'Request) a. SMethod m
   -> (TRequestMessage m -> Uri)
-  -> (TRequestMessage m -> (Either ResponseError (MessageResult m) -> TCM ()) -> Task)
+  -> ((?worker :: Worker) => TRequestMessage m -> (Either ResponseError (MessageResult m) -> TCM ()) -> TCM a)
   -> Handlers WorkerM
 requestHandlerTCM method uri cont = requestHandler method \req res -> withRunInIO \run -> run do
-  runAtURI (uri req) $ cont req \m -> liftIO (run (res m))
+  runAtURI (uri req) $ void $ cont req \m -> liftIO (run (res m))
 
 provideSemanticTokens :: Handlers WorkerM
 provideSemanticTokens =
@@ -406,6 +407,29 @@ goal = requestHandler (SMethod_CustomMethod (Proxy :: Proxy "agda/interactionPoi
         _ -> liftIO . run . res $ Right $ Aeson.Null
     Aeson.Error _ -> pure ()
 
+namedCompletionItem :: Text.Text -> CompletionItem
+namedCompletionItem !name = CompletionItem
+  { _textEditText        = Nothing
+  , _sortText            = Nothing
+  , _preselect           = Nothing
+  , _labelDetails        = Nothing
+  , _insertTextFormat    = Nothing
+  , _insertText          = Nothing
+  , _filterText          = Nothing
+  , _documentation       = Nothing
+  , _deprecated          = Nothing
+  , _commitCharacters    = Nothing
+  , _insertTextMode      = Nothing
+  , _textEdit            = Nothing
+  , _additionalTextEdits = Nothing
+  , _command             = Nothing
+  , _detail              = Nothing
+  , _kind                = Nothing
+  , _label               = name
+  , _data_               = Nothing
+  , _tags                = Nothing
+  }
+
 localCompletionItem :: Int -> Dom' Term (Name, Type) -> TCM (Maybe CompletionItem)
 localCompletionItem ix var@Dom{unDom = (name, ty)} = runMaybeT do
   ty <- Text.pack . Ppr.render <$> lift (prettyATop =<< reify (unEl (raise (ix + 1) ty)))
@@ -413,36 +437,20 @@ localCompletionItem ix var@Dom{unDom = (name, ty)} = runMaybeT do
   concrete <- lift (abstractToConcrete_ name)
   guard (C.InScope == C.isInScope concrete)
 
-  name <- Text.pack . Ppr.render <$> lift (prettyTCM name)
+  name <- Text.pack . Ppr.renderStyle (Ppr.Style Ppr.OneLineMode 0 0) <$> lift (prettyTCM name)
 
-  pure CompletionItem
-    { _textEditText        = Nothing
-    , _sortText            = Just ("00_" <> Text.pack (show ix))
-    , _preselect           = Nothing
-    , _labelDetails        = Just (CompletionItemLabelDetails (Just (" : " <> ty)) Nothing)
-    , _insertTextFormat    = Nothing
-    , _insertText          = Nothing
-    , _filterText          = Nothing
-    , _documentation       = Nothing
-    , _deprecated          = Nothing
-    , _commitCharacters    = Nothing
-    , _insertTextMode      = Nothing
-    , _textEdit            = Nothing
-    , _additionalTextEdits = Nothing
-    , _command             = Nothing
-    , _detail              = Nothing -- Just (" : " <> ty)
-    , _kind                = Just CompletionItemKind_Variable
-    , _label               = name
-    , _data_               = Nothing
-    , _tags                = Nothing
-    }
+  pure $! namedCompletionItem name
+    & sortText     ?~ "00_" <> Text.pack (show ix)
+    & labelDetails ?~ CompletionItemLabelDetails (Just (" : " <> ty)) Nothing
+    & kind         ?~ CompletionItemKind_Variable
 
 headMatches :: Maybe Type -> Type -> TCM Bool
 headMatches Nothing _ = pure True
 headMatches (Just t) t' = do
   TelV ctx t' <- telView t'
+  addContext ctx do
   t' <- fmap unEl <$> reduceB t'
-  t <- reduce t
+  t <- reduce (raise (Prelude.length ctx) t)
   case (ignoreBlocking t', unEl t) of
     (Var{}, _)   -> pure True
     (_, MetaV{}) -> pure True
@@ -461,7 +469,7 @@ definedCompletionItem want qnm = getConstInfo qnm >>= \def -> runMaybeT do
   name <- Text.pack . Ppr.render <$> lift (prettyTCM qnm)
 
   let
-    kind = case theDef def of
+    defKind = case theDef def of
       Axiom{}                             -> Just CompletionItemKind_Constant
       I.Datatype{}                        -> Just CompletionItemKind_Enum
       I.Record{}                          -> Just CompletionItemKind_Struct
@@ -474,31 +482,13 @@ definedCompletionItem want qnm = getConstInfo qnm >>= \def -> runMaybeT do
   guard =<< lift (headMatches want (defType def))
   ty <- Text.pack . Ppr.render <$> lift (inTopContext (prettyATop =<< reify (defType def)))
 
-  pure CompletionItem
-    { _textEditText        = Nothing
-    , _sortText            = Nothing
-    , _preselect           = Nothing
-    , _labelDetails        = Just (CompletionItemLabelDetails Nothing (Just (" : " <> ty)))
-    , _insertTextFormat    = Nothing
-    , _insertText          = Nothing
-    , _filterText          = Nothing
-    , _documentation       = Nothing
-    , _deprecated          = Nothing
-    , _commitCharacters    = Nothing
-    , _insertTextMode      = Nothing
-    , _textEdit            = Nothing
-    , _additionalTextEdits = Nothing
-    , _command             = Just Command {_arguments=Nothing, _title="Refine", _command="agda.refine"}
-    , _detail              = Nothing
-    , _kind                = kind
-    , _label               = name
-    , _data_               = Nothing
-    , _tags                = Nothing
-    }
+  pure $! namedCompletionItem name
+    & labelDetails ?~ CompletionItemLabelDetails (Just (" : " <> ty)) Nothing
+    & kind         .~ defKind
 
 completion :: Handlers WorkerM
 completion = requestHandlerTCM SMethod_TextDocumentCompletion (view (params . textDocument . uri)) \req res ->
-  void $ withPosition (req ^. params . position) \ip -> do
+  withPosition (req ^. params . position) \ip -> do
     ctx  <- getContext
     comp <- traverse (uncurry localCompletionItem) (zip [0..] ctx)
 
@@ -508,7 +498,7 @@ completion = requestHandlerTCM SMethod_TextDocumentCompletion (view (params . te
     reportSLn "lsp.completion" 10 $ show req
     res (Right (InL (catMaybes comp ++ catMaybes comp')))
 
-rangeContains :: PosDelta -> Position -> Range' a -> Bool
+rangeContains :: PosDelta -> Lsp.Position -> Range' a -> Bool
 rangeContains delta (Position linum colnum) rng = any go (rangeIntervals rng) where
   go ival = isJust do
     Position sl sc <- updatePosition delta (toLsp (iStart ival))
