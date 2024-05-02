@@ -38,7 +38,7 @@ import Language.LSP.Protocol.Message
 import Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Lens
 import Language.LSP.Server
-import Language.LSP.VFS (virtualFileText)
+import Language.LSP.VFS (virtualFileText, VirtualFile)
 
 import System.Exit
 import System.IO
@@ -82,6 +82,10 @@ import Agda.Utils.Impossible
 import Agda.Utils.FileName
 import Agda.Utils.Either
 import Agda.Utils.Lens
+import Agda.Syntax.Parser (runPMIO)
+import qualified Agda.Syntax.Parser as P
+import qualified Agda.Utils.Maybe.Strict as Strict
+import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -332,22 +336,22 @@ reloadURI = do
 
   reportSDoc "lsp.lifecycle" 10 $ "got warnings: " <+> prettyTCM (Imp.crWarnings cr)
 
-  ii <- useR stInteractionPoints
-  let
-    edits = BiMap.elems ii >>= \ip -> do
-      guard (isQuestion ip)
-      pure $! TextEdit (toLsp (ipRange ip)) "{! !}"
+  -- ii <- useR stInteractionPoints
+  -- let
+  --   edits = BiMap.elems ii >>= \ip -> do
+  --     guard (isQuestion ip)
+  --     pure $! TextEdit (toLsp (ipRange ip)) "{! !}"
 
-    edit = ApplyWorkspaceEditParams
-      { _label = Just "Question marks"
-      , _edit = WorkspaceEdit
-        { _documentChanges   = Nothing
-        , _changeAnnotations = Nothing
-        , _changes           = Just (Map.singleton (fromNormalizedUri (workerUri ?worker)) edits)
-        }
-      }
+  --   edit = ApplyWorkspaceEditParams
+  --     { _label = Just "Question marks"
+  --     , _edit = WorkspaceEdit
+  --       { _documentChanges   = Nothing
+  --       , _changeAnnotations = Nothing
+  --       , _changes           = Just (Map.singleton (fromNormalizedUri (workerUri ?worker)) edits)
+  --       }
+  --     }
 
-  requestTCM SMethod_WorkspaceApplyEdit edit (const (pure ()))
+  -- requestTCM SMethod_WorkspaceApplyEdit edit (const (pure ()))
 
 isQuestion :: InteractionPoint -> Bool
 isQuestion InteractionPoint{ipRange = r}
@@ -550,6 +554,30 @@ renderToJSON = toJSON . Ppr.fullRenderAnn Ppr.LeftMode 100 1.5 cont [] where
       | Just asp <- aspect a -> Mark (Just (toLsp asp)):acc
       | otherwise -> Mark Nothing:acc -- uncurry (<>) (break acc)
 
+runLspTCM :: (?worker :: Worker) => NormalizedUri -> TCM (Maybe VirtualFile)
+runLspTCM uri = liftIO $ runLspT (workerContext ?worker) (getVirtualFile uri)
+
+onTypeFormatting :: Handlers WorkerM
+onTypeFormatting = requestHandler SMethod_TextDocumentOnTypeFormatting \req res -> do
+  text <- fmap virtualFileText <$> getVirtualFile (toNormalizedUri (req ^. params . textDocument . uri))
+  case text of
+    Just text -> do
+      let
+        linum = req ^. params . position . line
+        l = Text.lines text !! fromIntegral linum
+
+        edit (TokSymbol SymQuestionMark ival)
+          | posPos (iEnd ival) == posPos (iStart ival) + 1
+          = pure $ TextEdit {_newText="{! !}", _range=toLsp ival}
+        edit _ = []
+
+      (toks, _) <- runPMIO $ P.parsePosString P.tokensParser (Pn Strict.Nothing 0 (fromIntegral linum + 1) 1) $ Text.unpack l
+      case toks of
+        Right (toks, _) -> res $ Right $ InL $ toks >>= edit
+        Left  _         -> res $ Right $ InR Lsp.Null
+
+    Nothing -> pure ()
+
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers _ = mconcat
   [ onTextDocumentOpen
@@ -561,5 +589,5 @@ lspHandlers _ = mconcat
   , provideSemanticTokens
   , goal
   , Agda.LSP.Main.completion
-  -- , Agda.LSP.Main.onTypeFormatting
+  , Agda.LSP.Main.onTypeFormatting
   ]
