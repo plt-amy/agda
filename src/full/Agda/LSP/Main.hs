@@ -23,6 +23,7 @@ import qualified Data.Set as Set
 
 import Data.HashMap.Strict (HashMap)
 import Data.List.NonEmpty (NonEmpty(..))
+import Data.Strict.Tuple (Pair(..))
 import Data.Aeson.Types as Aeson
 import Data.Foldable
 import Data.Default
@@ -85,6 +86,8 @@ import Agda.Utils.Lens
 import Agda.Syntax.Parser (runPMIO)
 import qualified Agda.Syntax.Parser as P
 import qualified Agda.Utils.Maybe.Strict as Strict
+import qualified Agda.Utils.RangeMap as RangeMap
+import Agda.Utils.RangeMap (RangeMap)
 import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
 
 data LspConfig = LspConfig
@@ -578,6 +581,43 @@ onTypeFormatting = requestHandler SMethod_TextDocumentOnTypeFormatting \req res 
 
     Nothing -> pure ()
 
+goToDefinition :: Handlers WorkerM
+goToDefinition = requestHandlerTCM SMethod_TextDocumentDefinition (view (params . textDocument . uri)) \req res -> do
+  info <- useTC stSyntaxInfo
+
+  delta <- liftIO $ readMVar (workerPosDelta ?worker)
+  let pos = downgradePosition delta (req ^. params . position)
+
+  tc <- getTCState
+  res case pos >>= flip findAspect info >>= definitionSite of
+    Just (DefinitionSite mod pos _ _)
+      | Just path <- tc ^. stModuleToSource . key mod
+      , Just info <- tc ^. stVisitedModules . key mod
+      , Just (_, RangeMap.PairInt (_ :!: node)) <- Map.lookupLE pos . RangeMap.rangeMap . iHighlighting . miInterface $ info
+      , aspectRange node /= noRange
+      ->
+        let srcUri = Lsp.filePathToUri (filePath path)
+            srcPos = toLsp (aspectRange node)
+        -- TODO: upgrade position if in the current file.
+        in Right . InL . Definition . InL $ Lsp.Location srcUri srcPos
+    _ -> notFound
+
+  where
+    notFound = Right . InR . InR $ Lsp.Null
+
+-- | Find an aspect at the specified position.
+findAspect :: Lsp.Position -> RangeMap Aspects -> Maybe Aspects
+findAspect position = find aspectMatches . map snd . RangeMap.toList where
+  -- TODO: This is currently a linear search. Ideally we'd be able to map
+  -- positions to byte offsets directly, which'd make this much more efficient.
+  -- Alternatively we could do a binary search over the aspect map, we just need
+  -- to ensure that all elements have a range.
+  aspectMatches a@Aspects{aspectRange = range}
+    | range == noRange = False
+    | otherwise = any intervalIncludes (rangeIntervals range)
+
+  intervalIncludes i = toLsp (iStart i) <= position && position <= toLsp (iEnd i)
+
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers _ = mconcat
   [ onTextDocumentOpen
@@ -590,4 +630,5 @@ lspHandlers _ = mconcat
   , goal
   , Agda.LSP.Main.completion
   , Agda.LSP.Main.onTypeFormatting
+  , goToDefinition
   ]
