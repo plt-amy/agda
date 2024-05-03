@@ -89,6 +89,7 @@ import qualified Agda.Utils.Maybe.Strict as Strict
 import qualified Agda.Utils.RangeMap as RangeMap
 import Agda.Utils.RangeMap (RangeMap)
 import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
+import qualified Debug.Trace as DT
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -581,25 +582,38 @@ onTypeFormatting = requestHandler SMethod_TextDocumentOnTypeFormatting \req res 
 
     Nothing -> pure ()
 
-goToDefinition :: Handlers WorkerM
-goToDefinition = requestHandlerTCM SMethod_TextDocumentDefinition (view (params . textDocument . uri)) \req res -> do
+goToDefinition :: ClientCapabilities -> Handlers WorkerM
+goToDefinition caps = requestHandlerTCM SMethod_TextDocumentDefinition (view (params . textDocument . uri)) \req res -> do
   info <- useTC stSyntaxInfo
 
   delta <- liftIO $ readMVar (workerPosDelta ?worker)
   let pos = downgradePosition delta (req ^. params . position)
 
   tc <- getTCState
-  res case pos >>= flip findAspect info >>= definitionSite of
+  let currentAspect = pos >>= flip findAspect info
+  res case currentAspect >>= definitionSite of
     Just (DefinitionSite mod pos _ _)
       | Just path <- tc ^. stModuleToSource . key mod
       , Just info <- tc ^. stVisitedModules . key mod
       , Just (_, RangeMap.PairInt (_ :!: node)) <- Map.lookupLE pos . RangeMap.rangeMap . iHighlighting . miInterface $ info
       , aspectRange node /= noRange
       ->
-        let srcUri = Lsp.filePathToUri (filePath path)
-            srcPos = toLsp (aspectRange node)
-        -- TODO: upgrade position if in the current file.
-        in Right . InL . Definition . InL $ Lsp.Location srcUri srcPos
+        let
+          srcUri = Lsp.filePathToUri (filePath path)
+          -- TODO: upgrade position if in the current file.
+          srcPos = toLsp (aspectRange node)
+        in Right
+        $ if fromMaybe False ((caps ^. textDocument) >>= (^. declaration) >>= (^. linkSupport))
+          then
+            let
+              link =  Lsp.LocationLink
+                      { _originSelectionRange = toLsp . aspectRange <$> currentAspect
+                      , _targetUri = srcUri
+                      , _targetRange = srcPos
+                      , _targetSelectionRange = srcPos
+                      }
+            in InR . InL $ [DefinitionLink link]
+          else InL . Definition . InL $ Lsp.Location srcUri srcPos
     _ -> notFound
 
   where
@@ -619,7 +633,7 @@ findAspect position = find aspectMatches . map snd . RangeMap.toList where
   intervalIncludes i = toLsp (iStart i) <= position && position <= toLsp (iEnd i)
 
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
-lspHandlers _ = mconcat
+lspHandlers caps = mconcat
   [ onTextDocumentOpen
   , onTextDocumentSaved
   , onTextDocumentClosed
@@ -630,5 +644,5 @@ lspHandlers _ = mconcat
   , goal
   , Agda.LSP.Main.completion
   , Agda.LSP.Main.onTypeFormatting
-  , goToDefinition
+  , goToDefinition caps
   ]
