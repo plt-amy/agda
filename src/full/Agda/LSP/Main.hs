@@ -521,11 +521,11 @@ completion = requestHandlerTCM SMethod_TextDocumentCompletion (view (params . te
     res (Right (InL (catMaybes comp ++ catMaybes comp')))
 
 rangeContains :: PosDelta -> Lsp.Position -> Range' a -> Bool
-rangeContains delta (Position linum colnum) rng = any go (rangeIntervals rng) where
+rangeContains delta pos rng = any go (rangeIntervals rng) where
   go ival = isJust do
-    Position sl sc <- updatePosition delta (toLsp (iStart ival))
-    Position el ec <- updatePosition delta (toLsp (iEnd ival))
-    guard $ and [ sl <= linum, linum <= el, sc <= colnum, colnum <= ec ]
+    start <- updatePosition delta (toLsp (iStart ival))
+    end <- updatePosition delta (toLsp (iEnd ival))
+    guard (start <= pos && pos <= end)
 
 data DocTree = Node SemanticTokenTypes [DocTree] | Text Text.Text | Mark (Maybe SemanticTokenTypes)
   deriving Generic
@@ -584,14 +584,13 @@ onTypeFormatting = requestHandler SMethod_TextDocumentOnTypeFormatting \req res 
 
 goToDefinition :: ClientCapabilities -> Handlers WorkerM
 goToDefinition caps = requestHandlerTCM SMethod_TextDocumentDefinition (view (params . textDocument . uri)) \req res -> do
-  info <- useTC stSyntaxInfo
   reportSLn "lsp.definition" 10 $ show req
 
+  info <- useTC stSyntaxInfo
   delta <- liftIO $ readMVar (workerPosDelta ?worker)
-  let pos = downgradePosition delta (req ^. params . position)
-
   tc <- getTCState
-  let currentAspect = pos >>= flip findAspect info
+
+  let currentAspect = findAspect delta (req ^. params . position) info
   res case currentAspect >>= definitionSite of
     Just (DefinitionSite mod pos _ _)
       | Just path <- tc ^. stModuleToSource . key mod
@@ -621,17 +620,13 @@ goToDefinition caps = requestHandlerTCM SMethod_TextDocumentDefinition (view (pa
     notFound = Right . InR . InR $ Lsp.Null
 
 -- | Find an aspect at the specified position.
-findAspect :: Lsp.Position -> RangeMap Aspects -> Maybe Aspects
-findAspect position = find aspectMatches . map snd . RangeMap.toList where
+findAspect :: PosDelta -> Lsp.Position -> RangeMap Aspects -> Maybe Aspects
+findAspect delta position =
   -- TODO: This is currently a linear search. Ideally we'd be able to map
   -- positions to byte offsets directly, which'd make this much more efficient.
   -- Alternatively we could do a binary search over the aspect map, we just need
   -- to ensure that all elements have a range.
-  aspectMatches a@Aspects{aspectRange = range}
-    | range == noRange = False
-    | otherwise = any intervalIncludes (rangeIntervals range)
-
-  intervalIncludes i = toLsp (iStart i) <= position && position <= toLsp (iEnd i)
+  find (rangeContains delta position . aspectRange) . map snd . RangeMap.toList
 
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers caps = mconcat
