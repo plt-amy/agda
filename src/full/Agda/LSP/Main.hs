@@ -585,6 +585,7 @@ onTypeFormatting = requestHandler SMethod_TextDocumentOnTypeFormatting \req res 
 goToDefinition :: ClientCapabilities -> Handlers WorkerM
 goToDefinition caps = requestHandlerTCM SMethod_TextDocumentDefinition (view (params . textDocument . uri)) \req res -> do
   info <- useTC stSyntaxInfo
+  reportSLn "lsp.definition" 10 $ show req
 
   delta <- liftIO $ readMVar (workerPosDelta ?worker)
   let pos = downgradePosition delta (req ^. params . position)
@@ -602,16 +603,16 @@ goToDefinition caps = requestHandlerTCM SMethod_TextDocumentDefinition (view (pa
           srcUri = Lsp.filePathToUri (filePath path)
           -- TODO: upgrade position if in the current file.
           srcPos = toLsp (aspectRange node)
-        in Right
-        $ if fromMaybe False ((caps ^. textDocument) >>= (^. declaration) >>= (^. linkSupport))
+        in Right $
+          if fromMaybe False ((caps ^. textDocument) >>= view declaration >>= view linkSupport)
           then
             let
-              link =  Lsp.LocationLink
-                      { _originSelectionRange = toLsp . aspectRange <$> currentAspect
-                      , _targetUri = srcUri
-                      , _targetRange = srcPos
-                      , _targetSelectionRange = srcPos
-                      }
+              link = Lsp.LocationLink
+                { _originSelectionRange = toLsp . aspectRange <$> currentAspect
+                , _targetUri = srcUri
+                , _targetRange = srcPos
+                , _targetSelectionRange = srcPos
+                }
             in InR . InL $ [DefinitionLink link]
           else InL . Definition . InL $ Lsp.Location srcUri srcPos
     _ -> notFound
