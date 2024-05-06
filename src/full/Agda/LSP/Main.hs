@@ -694,41 +694,64 @@ getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params 
         , _data_ = Nothing
         }
 
+-- | Handle a command inside the TCM monad.
+commandHandlerTCM
+  :: Uri
+  -> (Either ResponseError (Value |? Null) -> WorkerM ())
+  -> ((?worker :: Worker)
+    => (forall a. WorkerM a -> IO a)
+    -> TCM (Either ResponseError (Value |? Null)))
+  -> WorkerM ()
+commandHandlerTCM uri res cont = withRunInIO \run -> run $
+  runAtURI uri (cont run >>= (liftIO . run . res))
+
+-- | Handle a command at an interaction point.
+commandHandlerInteractionPoint
+  :: Uri
+  -> Lsp.Position
+  -> (Either ResponseError (Value |? Null) -> WorkerM ())
+  -> ((?worker :: Worker)
+    => (forall a. WorkerM a -> IO a)
+    -> InteractionId -> InteractionPoint -> Lsp.Range -> Text.Text
+    -> TCM (Either ResponseError (Value |? Null)))
+  -> WorkerM ()
+commandHandlerInteractionPoint uri pos res cont = commandHandlerTCM uri res \run -> do
+    pos <- findInteractionPoint pos
+    virtualFile <- liftIO . run . getVirtualFile $ toNormalizedUri uri
+    delta <- liftIO $ readMVar (workerPosDelta ?worker)
+
+    case pos of
+      Just (ii , ip)
+        | Just range <- interactionRange delta ip
+        , Just contents <- virtualFile >>= flip interactionContents range
+        -> cont run ii ip range contents
+
+      _ -> pure . Left $
+        ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot find interaction at this point" Nothing
+
 executeAgdaCommand :: Handlers WorkerM
 executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
   case parseCommand (req ^. params . command) (fromMaybe [] (req ^. params . arguments)) of
     Nothing -> res (Left (ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot parse command" Nothing))
-    -- TODO: Some sort of similar wrapper to requestHandlerTCM
-    Just (Command_Auto uri pos) -> withRunInIO \run -> run $ runAtURI uri do
-      pos <- findInteractionPoint pos
-      virtualFile <- liftIO . run . getVirtualFile $ toNormalizedUri uri
-      delta <- liftIO $ readMVar (workerPosDelta ?worker)
+    Just (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \run ii ip range contents -> do
+      -- TODO: What's the proper range here? This gets passed from the elisp side, so
+      -- I think it's the *inside* of the interaction point, after edits have been applied.
+      result <- Mimer.mimer ii (ipRange ip) (Text.unpack contents)
+      case result of
+        Mimer.MimerNoResult -> showMessage run MessageType_Error "No solution found"
+        MimerExpr str -> do
+          let edit = ApplyWorkspaceEditParams (Just "Proof Search") $ WorkspaceEdit
+                { _changes = Just (Map.singleton uri [TextEdit range (Text.pack str)])
+                , _documentChanges = Nothing
+                , _changeAnnotations = Nothing
+                }
+          void . liftIO . run $ sendRequest SMethod_WorkspaceApplyEdit edit (\_ -> pure ())
+        MimerList sols -> showMessage run MessageType_Info . Text.pack $
+            "Multiple solutions:" ++
+            intercalate "\n" ["  " ++ show i ++ ". " ++ s | (i, s) <- sols]
+        MimerClauses{} -> __IMPOSSIBLE__    -- Mimer can't do case splitting yet
 
-      case pos of
-        Just (ii , ip)
-          | Just range <- interactionRange delta ip
-          , Just contents <- virtualFile >>= flip interactionContents range
-          -> do
-          iscope <- getInteractionScope ii
-          -- TODO: What's the proper range here? This gets passed from the elisp side, so
-          -- I think it's the *inside* of the interaction point, after edits have been applied.
-          result <- Mimer.mimer ii (ipRange ip) (Text.unpack contents)
-          case result of
-            Mimer.MimerNoResult -> showMessage run MessageType_Error "No solution found"
-            MimerExpr str -> do
-              let edit = ApplyWorkspaceEditParams (Just "Proof Search") $ WorkspaceEdit
-                    { _changes = Just (Map.singleton uri [TextEdit range (Text.pack str)])
-                    , _documentChanges = Nothing
-                    , _changeAnnotations = Nothing
-                    }
-              void . liftIO . run $ sendRequest SMethod_WorkspaceApplyEdit edit (\_ -> pure ())
-            MimerList sols -> showMessage run MessageType_Info . Text.pack $
-                "Multiple solutions:" ++
-                intercalate "\n" ["  " ++ show i ++ ". " ++ s | (i, s) <- sols]
-            MimerClauses{} -> __IMPOSSIBLE__    -- Mimer can't do case splitting yet
-        _ -> showMessage run MessageType_Error "Cannot find interaction at this point"
-
-      liftIO . run . res $ (Right (InR Lsp.Null))
+      pure (Right (InR Lsp.Null))
 
   where
     showMessage run kind msg = liftIO . run $ sendNotification SMethod_WindowShowMessage $ ShowMessageParams kind msg
