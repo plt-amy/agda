@@ -14,8 +14,10 @@ import Control.Concurrent
 import Control.Exception
 import Control.Monad
 
+import qualified Data.Text.Utf16.Rope.Mixed as Rope
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Aeson.KeyMap as KeyMap
+import qualified Data.Text.Lines as TextLines
 import qualified Data.Text.Lazy as TL
 import qualified Data.Text as Text
 import qualified Data.Map as Map
@@ -31,7 +33,7 @@ import Data.Proxy
 import Data.IORef
 import Data.Coerce
 import Data.Maybe
-import Data.List (find, sortOn)
+import Data.List (find, sortOn, intercalate)
 
 import GHC.Generics
 
@@ -39,7 +41,7 @@ import Language.LSP.Protocol.Message
 import Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Lens
 import Language.LSP.Server
-import Language.LSP.VFS (virtualFileText, VirtualFile)
+import Language.LSP.VFS (virtualFileText, rangeLinesFromVfs, VirtualFile, file_text)
 
 import System.Exit
 import System.IO
@@ -84,12 +86,14 @@ import Agda.Utils.FileName
 import Agda.Utils.Either
 import Agda.Utils.Lens
 import Agda.Syntax.Parser (runPMIO)
+import Agda.Mimer.Mimer as Mimer
 import qualified Agda.Syntax.Parser as P
 import qualified Agda.Utils.Maybe.Strict as Strict
 import qualified Agda.Utils.RangeMap as RangeMap
 import Agda.Utils.RangeMap (RangeMap)
 import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
-import qualified Debug.Trace as DT
+import Agda.LSP.Commands
+import Agda.Syntax.Common (InteractionId)
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -162,6 +166,7 @@ runAgdaLSP setup = do
     , options          = def
       { optTextDocumentSync = Just syncOptions
       , optDocumentOnTypeFormattingTriggerCharacters = Just ('?' :| [])
+      , optExecuteCommandCommands = Just (map commandName [minBound..maxBound])
       }
     }
 
@@ -388,15 +393,36 @@ onInitialized = notificationHandler SMethod_Initialized \notif -> do
   sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/highlightingInit"))
     $ Object $ KeyMap.singleton "legend" (toJSON agdaTokenLegend)
 
+-- | Get a substring of a file based on an Lsp range.
+getFileSubstring :: VirtualFile -> Lsp.Range -> Text.Text
+getFileSubstring file (Lsp.Range (Lsp.Position sL sC) (Lsp.Position eL eC)) =
+  let
+    rope = file ^. file_text
+    (_, prefix) = Rope.charSplitAtPosition (TextLines.Position (fromIntegral sL) (fromIntegral sC)) rope
+
+    len = if sL == eL then eC - sC else eC
+    (main, _) = Rope.charSplitAtPosition (TextLines.Position (fromIntegral (eL - sL)) (fromIntegral len)) prefix
+  in
+  Rope.toText main
+
+-- | Get the current/latest range of the current interaction point.
+interactionRange :: PosDelta -> InteractionPoint -> Maybe Lsp.Range
+interactionRange delta ip = rangeToInterval (ipRange ip) >>= updatePosition delta . toLsp
+
+-- | Get the contents of an interaction point, if still present in the document.
+interactionContents :: VirtualFile -> Lsp.Range -> Maybe Text.Text
+interactionContents file range =
+  fmap Text.strip . Text.stripPrefix "{!" <=< Text.stripSuffix "!}" $ getFileSubstring file range
+
+findInteractionPoint :: (?worker :: Worker) => Lsp.Position -> TCM (Maybe (InteractionId, InteractionPoint))
+findInteractionPoint pos = do
+  ii <- useR stInteractionPoints
+  delta <- liftIO $ readMVar (workerPosDelta ?worker)
+  pure $ find (rangeContains delta pos . ipRange . snd) (BiMap.toList ii)
+
 withPosition :: (?worker :: Worker) => Lsp.Position -> (InteractionPoint -> TCM a) -> TCM (Maybe a)
 withPosition pos cont = do
-  ii <- useR stInteractionPoints
-  delta <- liftIO $ tryReadMVar (workerPosDelta ?worker)
-  let
-    containing = do
-      delta <- delta
-      find (rangeContains delta pos . ipRange . snd) (BiMap.toList ii)
-
+  containing <- findInteractionPoint pos
   case containing of
     Just (iid, ip) -> Just <$> withInteractionId iid (cont ip)
     Nothing -> pure Nothing
@@ -628,6 +654,85 @@ findAspect delta position =
   -- to ensure that all elements have a range.
   find (rangeContains delta position . aspectRange) . map snd . RangeMap.toList
 
+getCodeActions :: Handlers WorkerM
+getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params . textDocument . uri)) \req res -> do
+  let fileUri = req ^. params . textDocument . uri
+  reportSLn "lsp.codeAction" 10 $ show req
+
+  ii <- useR stInteractionPoints
+  delta <- liftIO $ readMVar (workerPosDelta ?worker)
+
+  let
+    reqRange@(Lsp.Range reqStart reqEnd) = req ^. params . range
+
+    -- Determine if this interaction point overlaps with the provided range
+    -- at all
+    containing =
+      filter (\(Lsp.Range iS iE) -> iE >= reqStart && iS <= reqEnd)
+        . mapMaybe (interactionRange delta)
+        $ BiMap.elems ii
+
+  res . Right $ case containing of
+    [] -> InL []
+    [range] -> InL
+      [ InR $
+          makeCodeAction "Run proof search on this goal" (Command_Auto fileUri (range ^. start))
+        -- TODO: If the hole is non-empty, offer an option to fill
+      ]
+    _ -> InL []
+
+  where
+      makeCodeAction title command =
+        CodeAction
+        { _title = title
+        , _kind = Just CodeActionKind_QuickFix
+        , _diagnostics = Nothing
+        , _isPreferred = Nothing
+        , _disabled = Nothing
+        , _edit = Nothing
+        , _command = Just (toCommand title command)
+        , _data_ = Nothing
+        }
+
+executeAgdaCommand :: Handlers WorkerM
+executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
+  case parseCommand (req ^. params . command) (fromMaybe [] (req ^. params . arguments)) of
+    Nothing -> res (Left (ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot parse command" Nothing))
+    -- TODO: Some sort of similar wrapper to requestHandlerTCM
+    Just (Command_Auto uri pos) -> withRunInIO \run -> run $ runAtURI uri do
+      pos <- findInteractionPoint pos
+      virtualFile <- liftIO . run . getVirtualFile $ toNormalizedUri uri
+      delta <- liftIO $ readMVar (workerPosDelta ?worker)
+
+      case pos of
+        Just (ii , ip)
+          | Just range <- interactionRange delta ip
+          , Just contents <- virtualFile >>= flip interactionContents range
+          -> do
+          iscope <- getInteractionScope ii
+          -- TODO: What's the proper range here? This gets passed from the elisp side, so
+          -- I think it's the *inside* of the interaction point, after edits have been applied.
+          result <- Mimer.mimer ii (ipRange ip) (Text.unpack contents)
+          case result of
+            Mimer.MimerNoResult -> showMessage run MessageType_Error "No solution found"
+            MimerExpr str -> do
+              let edit = ApplyWorkspaceEditParams (Just "Proof Search") $ WorkspaceEdit
+                    { _changes = Just (Map.singleton uri [TextEdit range (Text.pack str)])
+                    , _documentChanges = Nothing
+                    , _changeAnnotations = Nothing
+                    }
+              void . liftIO . run $ sendRequest SMethod_WorkspaceApplyEdit edit (\_ -> pure ())
+            MimerList sols -> showMessage run MessageType_Info . Text.pack $
+                "Multiple solutions:" ++
+                intercalate "\n" ["  " ++ show i ++ ". " ++ s | (i, s) <- sols]
+            MimerClauses{} -> __IMPOSSIBLE__    -- Mimer can't do case splitting yet
+        _ -> showMessage run MessageType_Error "Cannot find interaction at this point"
+
+      liftIO . run . res $ (Right (InR Lsp.Null))
+
+  where
+    showMessage run kind msg = liftIO . run $ sendNotification SMethod_WindowShowMessage $ ShowMessageParams kind msg
+
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers caps = mconcat
   [ onTextDocumentOpen
@@ -641,4 +746,6 @@ lspHandlers caps = mconcat
   , Agda.LSP.Main.completion
   , Agda.LSP.Main.onTypeFormatting
   , goToDefinition caps
+  , getCodeActions
+  , executeAgdaCommand
   ]
