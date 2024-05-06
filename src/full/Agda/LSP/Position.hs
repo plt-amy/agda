@@ -112,12 +112,21 @@ changeToDelta (TextDocumentContentChangeEvent (InL x)) =
   PosDelta (toCurrent (x .! #range) (x .! #text)) (fromCurrent (x .! #range) (x .! #text))
 changeToDelta _ = mempty
 
-updatePosition :: PosDelta -> Position -> Maybe Position
-updatePosition delta pos = case toDelta delta pos of
-  ExactR r -> Just r
-  _ -> Nothing
 
-downgradePosition :: PosDelta -> Position -> Maybe Position
-downgradePosition delta pos = case fromDelta delta pos of
-  ExactR r -> Just r
-  _ -> Nothing
+class Positionable a where
+  updatePosition :: PosDelta -> a -> Maybe a
+  downgradePosition :: PosDelta -> a -> Maybe a
+
+
+instance Positionable Position where
+  updatePosition delta pos = case toDelta delta pos of
+    ExactR r -> Just r
+    _ -> Nothing
+
+  downgradePosition delta pos = case fromDelta delta pos of
+    ExactR r -> Just r
+    _ -> Nothing
+
+instance Positionable Range where
+  updatePosition delta (Range s e) = Range <$> updatePosition delta s <*> updatePosition delta e
+  downgradePosition delta (Range s e) = Range <$> downgradePosition delta s <*> downgradePosition delta e
