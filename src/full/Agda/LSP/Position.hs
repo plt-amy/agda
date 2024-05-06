@@ -1,5 +1,9 @@
 {-# LANGUAGE OverloadedLabels #-}
-module Agda.LSP.Position where
+module Agda.LSP.Position
+  ( PosDelta
+  , changeToDelta
+  , Positionable(..)
+  ) where
 
 import Control.Monad
 
@@ -7,9 +11,6 @@ import qualified Data.Text as T
 import Data.Row.Records
 
 import Language.LSP.Protocol.Types as Lsp
-import Language.LSP.Protocol.Lens
-
-import Agda.Utils.Lens
 
 data Result a
   = RangeR a a
@@ -127,6 +128,15 @@ instance Positionable Position where
     ExactR r -> Just r
     _ -> Nothing
 
+-- | Transform a range and ensure its invariants still hold.
+mapRange :: (PosDelta -> Position -> Maybe Position) -> PosDelta -> Range -> Maybe Range
+mapRange f delta (Range s e) = do
+  s' <- f delta s
+  e' <- f delta e
+  guard (s' <= e')
+  pure (Range s' e')
+
+
 instance Positionable Range where
-  updatePosition delta (Range s e) = Range <$> updatePosition delta s <*> updatePosition delta e
-  downgradePosition delta (Range s e) = Range <$> downgradePosition delta s <*> downgradePosition delta e
+  updatePosition = mapRange updatePosition
+  downgradePosition = mapRange downgradePosition
