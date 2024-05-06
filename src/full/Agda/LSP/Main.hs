@@ -59,6 +59,8 @@ import Agda.Syntax.Abstract.Pretty
 import Agda.Syntax.Concrete.Pretty () -- Instances only
 import Agda.Syntax.Scope.Base
 import Agda.Syntax.Concrete (Module(modDecls))
+import Agda.Syntax.Common.Pretty (prettyShow)
+import Agda.Syntax.Common (InteractionId)
 import Agda.Syntax.Position
 import Agda.Syntax.Internal
 
@@ -72,12 +74,14 @@ import Agda.LSP.Translation
 import Agda.LSP.Position
 
 import qualified Agda.Interaction.Imports as Imp
+import qualified Agda.Interaction.BasicOps as B
 import Agda.Interaction.Highlighting.Precise
 import Agda.Interaction.Highlighting.Common (toAtoms)
 import Agda.Interaction.Response.Base
 import Agda.Interaction.FindFile (SourceFile(SourceFile))
 import Agda.Interaction.BasicOps (getWarningsAndNonFatalErrors)
 import Agda.Interaction.JSONTop () -- Instances only
+import Agda.Interaction.Base
 
 import qualified Agda.Utils.RangeMap as RangeMap
 import qualified Agda.Utils.BiMap as BiMap
@@ -94,7 +98,7 @@ import qualified Agda.Utils.RangeMap as RangeMap
 import Agda.Utils.RangeMap (RangeMap)
 import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
 import Agda.LSP.Commands
-import Agda.Syntax.Common (InteractionId)
+    ( CommandArgs(Command_Auto, Command_Give), commandName, toCommand, parseCommand )
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -411,9 +415,13 @@ interactionRange :: PosDelta -> InteractionPoint -> Maybe Lsp.Range
 interactionRange delta ip = rangeToInterval (ipRange ip) >>= updatePosition delta . toLsp
 
 -- | Get the contents of an interaction point, if still present in the document.
-interactionContents :: VirtualFile -> Lsp.Range -> Maybe Text.Text
-interactionContents file range =
-  fmap Text.strip . Text.stripPrefix "{!" <=< Text.stripSuffix "!}" $ getFileSubstring file range
+interactionContents :: VirtualFile -> Lsp.Range -> Maybe (Lsp.Range, Text.Text)
+interactionContents file range = do
+  contents <- Text.stripPrefix "{!" <=< Text.stripSuffix "!}" $ getFileSubstring file range
+  -- TODO: Correctly adjust this range to account for stripped whitespace
+  pure
+    ( ((start . character) %~ (+ 2)) . ((end . character) %~ (subtract 2)) $ range
+    , Text.strip contents )
 
 findInteractionPoint :: (?worker :: Worker) => Lsp.Position -> TCM (Maybe (InteractionId, InteractionPoint))
 findInteractionPoint pos = do
@@ -585,8 +593,8 @@ renderToJSON = toJSON . Ppr.fullRenderAnn Ppr.LeftMode 100 1.5 cont [] where
       | Just asp <- aspect a -> Mark (Just (toLsp asp)):acc
       | otherwise -> Mark Nothing:acc -- uncurry (<>) (break acc)
 
-runLspTCM :: (?worker :: Worker) => NormalizedUri -> TCM (Maybe VirtualFile)
-runLspTCM uri = liftIO $ runLspT (workerContext ?worker) (getVirtualFile uri)
+runLspTCM :: (?worker :: Worker) => LspT LspConfig IO a -> TCM a
+runLspTCM t = liftIO $ runLspT (workerContext ?worker) t
 
 onTypeFormatting :: Handlers WorkerM
 onTypeFormatting = requestHandler SMethod_TextDocumentOnTypeFormatting \req res -> do
@@ -680,24 +688,29 @@ getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params 
 
   ii <- useR stInteractionPoints
   delta <- liftIO $ readMVar (workerPosDelta ?worker)
+  virtualFile <- runLspTCM . getVirtualFile $ toNormalizedUri fileUri
 
   let
     reqRange@(Lsp.Range reqStart reqEnd) = req ^. params . range
 
+    resolveInteraction ip = do
+      range <- interactionRange delta ip
+      (_, contents) <- virtualFile >>= flip interactionContents range
+      pure (range, not (Text.null contents))
+
     -- Determine if this interaction point overlaps with the provided range
     -- at all
     containing =
-      filter (\(Lsp.Range iS iE) -> iE >= reqStart && iS <= reqEnd)
-        . mapMaybe (interactionRange delta)
+      filter (\((Lsp.Range iS iE), _) -> iE >= reqStart && iS <= reqEnd)
+        . mapMaybe resolveInteraction
         $ BiMap.elems ii
 
   res . Right $ case containing of
     [] -> InL []
-    [range] -> InL
-      [ InR $
-          makeCodeAction "Run proof search on this goal" (Command_Auto fileUri (range ^. start))
-        -- TODO: If the hole is non-empty, offer an option to fill
-      ]
+    [(range, nonEmpty)] -> InL $
+      [ InR $ makeCodeAction "Run proof search on this goal" (Command_Auto fileUri (range ^. start)) ] ++
+      -- TODO: Refine
+      [ InR $ makeCodeAction "Fill goal with current contents" (Command_Give fileUri (range ^. start)) | nonEmpty ]
     _ -> InL []
 
   where
@@ -731,7 +744,7 @@ commandHandlerInteractionPoint
   -> (Either ResponseError (Value |? Null) -> WorkerM ())
   -> ((?worker :: Worker)
     => (forall a. WorkerM a -> IO a)
-    -> InteractionId -> InteractionPoint -> Lsp.Range -> Text.Text
+    -> InteractionId -> InteractionPoint -> Lsp.Range -> Lsp.Range -> Text.Text
     -> TCM (Either ResponseError (Value |? Null)))
   -> WorkerM ()
 commandHandlerInteractionPoint uri pos res cont = commandHandlerTCM uri res \run -> do
@@ -742,8 +755,8 @@ commandHandlerInteractionPoint uri pos res cont = commandHandlerTCM uri res \run
     case pos of
       Just (ii , ip)
         | Just range <- interactionRange delta ip
-        , Just contents <- virtualFile >>= flip interactionContents range
-        -> cont run ii ip range contents
+        , Just (innerRange, contents) <- virtualFile >>= flip interactionContents range
+        -> cont run ii ip range innerRange contents
 
       _ -> pure . Left $
         ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot find interaction at this point" Nothing
@@ -752,19 +765,14 @@ executeAgdaCommand :: Handlers WorkerM
 executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
   case parseCommand (req ^. params . command) (fromMaybe [] (req ^. params . arguments)) of
     Nothing -> res (Left (ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot parse command" Nothing))
-    Just (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \run ii ip range contents -> do
+    Just (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \run ii ip range innerRange contents -> do
       -- TODO: What's the proper range here? This gets passed from the elisp side, so
       -- I think it's the *inside* of the interaction point, after edits have been applied.
-      result <- Mimer.mimer ii (ipRange ip) (Text.unpack contents)
+      result <- Mimer.mimer ii (adjustIpRange ip innerRange) (Text.unpack contents)
       case result of
         Mimer.MimerNoResult -> showMessage run MessageType_Error "No solution found"
-        MimerExpr str -> do
-          let edit = ApplyWorkspaceEditParams (Just "Proof Search") $ WorkspaceEdit
-                { _changes = Just (Map.singleton uri [TextEdit range (Text.pack str)])
-                , _documentChanges = Nothing
-                , _changeAnnotations = Nothing
-                }
-          void . liftIO . run $ sendRequest SMethod_WorkspaceApplyEdit edit (\_ -> pure ())
+        MimerExpr str ->
+          applyEdit run "Proof Search" (Map.singleton uri [TextEdit range (Text.pack str)])
         MimerList sols -> showMessage run MessageType_Info . Text.pack $
             "Multiple solutions:" ++
             intercalate "\n" ["  " ++ show i ++ ". " ++ s | (i, s) <- sols]
@@ -772,8 +780,44 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
 
       pure (Right (InR Lsp.Null))
 
+    Just (Command_Give uri pos) -> commandHandlerInteractionPoint uri pos res \run ii ip range innerRange contents -> do
+      scope <- getInteractionScope ii
+
+      given <- B.parseExprIn ii (adjustIpRange ip innerRange) (Text.unpack contents)
+      res <- B.give WithoutForce ii Nothing given
+
+      ce <- abstractToConcreteScope scope res
+
+      let text = if given == res then contents else Text.pack (prettyShow ce)
+      applyEdit run "Give" (Map.singleton uri [TextEdit range text])
+
+      -- TODO: How do we handle updating interaction points and highlighting here,
+      -- short of just rechecking the entire file?
+
+      pure (Right (InR Lsp.Null))
+
   where
     showMessage run kind msg = liftIO . run $ sendNotification SMethod_WindowShowMessage $ ShowMessageParams kind msg
+
+    applyEdit run title changes =
+      let
+        edit = ApplyWorkspaceEditParams (Just title) $ WorkspaceEdit
+          { _changes = Just changes
+          , _documentChanges = Nothing
+          , _changeAnnotations = Nothing
+          }
+      in void . liftIO . run $ sendRequest SMethod_WorkspaceApplyEdit edit (\_ -> pure ())
+
+    adjustIpRange ip (Lsp.Range s e) =
+      let range = ipRange ip in
+      case rangeToInterval range of
+        Nothing -> NoRange
+        Just (Interval iS iE) ->
+          -- TODO: Move this somewhere which doesn't make me cry.
+          let
+            iS' = iS { posLine = fromIntegral ((s ^. line) + 1), posCol = fromIntegral (s ^. character + 1) }
+            iE' = iE { posLine = fromIntegral ((e ^. line) + 1), posCol = fromIntegral (e ^. character + 1) }
+          in intervalToRange (rangeFile range) (Interval iS' iE')
 
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers caps = mconcat
