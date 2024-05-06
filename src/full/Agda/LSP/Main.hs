@@ -23,6 +23,7 @@ import qualified Data.Text as Text
 import qualified Data.Map as Map
 import qualified Data.Set as Set
 
+import Data.Containers.ListUtils (nubOrd)
 import Data.HashMap.Strict (HashMap)
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Strict.Tuple (Pair(..))
@@ -654,6 +655,24 @@ findAspect delta position =
   -- to ensure that all elements have a range.
   find (rangeContains delta position . aspectRange) . map snd . RangeMap.toList
 
+highlightReferences :: Handlers WorkerM
+highlightReferences = requestHandlerTCM SMethod_TextDocumentDocumentHighlight (view (params . textDocument . uri)) \req res -> do
+  reportSLn "lsp.documentHighlight" 10 $ show req
+
+  info <- useTC stSyntaxInfo
+  delta <- liftIO $ readMVar (workerPosDelta ?worker)
+
+  let currentAspect = findAspect delta (req ^. params . position) info
+  res case currentAspect >>= definitionSite of
+    Nothing -> Right . InR $ Lsp.Null
+    Just s@(DefinitionSite mod pos _ _) -> Right . InL
+      . nubOrd
+      . concatMap (mapMaybe (fmap makeHighlight . updatePosition delta . toLsp) . rangeIntervals . aspectRange . snd)
+      . filter (\(_, x) -> elem s (definitionSite x))
+      $ RangeMap.toList info
+
+  where makeHighlight r = DocumentHighlight r (Just DocumentHighlightKind_Read)
+
 getCodeActions :: Handlers WorkerM
 getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params . textDocument . uri)) \req res -> do
   let fileUri = req ^. params . textDocument . uri
@@ -769,6 +788,7 @@ lspHandlers caps = mconcat
   , Agda.LSP.Main.completion
   , Agda.LSP.Main.onTypeFormatting
   , goToDefinition caps
+  , highlightReferences
   , getCodeActions
   , executeAgdaCommand
   ]
