@@ -349,7 +349,7 @@ getLastPos = gets parseLastPos
 getParseInterval :: Parser Interval
 getParseInterval = do
   s <- get
-  return $ posToInterval (parseSrcFile s) (parseLastPos s) (backupPos (parsePos s))
+  return $ posToInterval (parseSrcFile s) (parseLastPos s) (parsePos s)
 
 getLexState :: Parser [LexState]
 getLexState = gets parseLexState
