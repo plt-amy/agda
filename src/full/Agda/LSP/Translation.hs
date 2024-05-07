@@ -27,7 +27,7 @@ import Agda.Syntax.Common.Aspect as Asp
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.FileName (filePath)
 import Agda.Syntax.Abstract.Name (Name(nameBindingSite), qnameName)
-import Agda.LSP.Position (PosDelta, updatePosition)
+import Agda.LSP.Position (PosDelta, updatePosition, Positionable (downgradePosition))
 import Control.Monad (guard)
 
 class ToLsp a where
@@ -40,7 +40,10 @@ instance ToLsp (Position' a) where
 
 instance ToLsp (Interval' a) where
   type LspType (Interval' a) = Lsp.Range
-  toLsp (Interval start end) = Lsp.Range (toLsp start) (toLsp end)
+  toLsp (Interval start end) =
+    let
+      Lsp.Position le ce = toLsp end
+    in Lsp.Range (toLsp start) (Lsp.Position le ce)
 
 instance ToLsp (Range' a) where
   type LspType (Range' a) = Lsp.Range
@@ -139,15 +142,14 @@ aspectMapToTokens delta = concatMap go . RangeMap.toList where
     Just asp ->
       let
         tok ival = do
-          Lsp.Position line col <- updatePosition delta (toLsp (iStart ival))
-          Lsp.Position line' col' <- updatePosition delta (toLsp (iEnd ival))
+          Lsp.Range (Lsp.Position line col) (Lsp.Position line' col') <- updatePosition delta (toLsp ival)
           guard (line == line')
 
           pure Lsp.SemanticTokenAbsolute
             { _tokenType      = toLsp asp
             , _line           = line
             , _startChar      = col
-            , _length         = col' - col
+            , _length         = 1 + col' - col
             , _tokenModifiers = []
             }
       in mapMaybe tok (rangeIntervals range)
@@ -159,3 +161,15 @@ aspectMapToTokens delta = concatMap go . RangeMap.toList where
       -- }
     _ -> []
   go _ = []
+
+rangeContains :: PosDelta -> Lsp.Position -> Range' a -> Bool
+rangeContains delta pos rng = any go (rangeIntervals rng) where
+  go ival = or
+    [ isJust do
+        pos <- downgradePosition delta pos
+        guard (toLsp (iStart ival) <= pos && pos <= toLsp (iEnd ival))
+    , isJust do
+        start <- updatePosition delta (toLsp (iStart ival))
+        end <- updatePosition delta (toLsp (iEnd ival))
+        guard (start <= pos && pos <= end)
+    ]
