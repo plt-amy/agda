@@ -459,12 +459,11 @@ library
     , zlib                 >= 0.6       && < 0.8
 
     -- Language server stuff
-    , lsp                  >= 2.4.0.0   && < 2.5
-    , lsp-types            >= 2.1.0.0   && < 2.2
+    , lsp                  >= 2.6.0.0   && < 2.7
+    , lsp-types            >= 2.2.0.0   && < 2.3
     , text-rope            >= 0.2       && < 0.3
     , unliftio-core        >= 0.2       && < 0.3
     , data-default         >= 0.7       && < 0.8
-    , row-types            >= 1.0       && < 1.1
 
   -- We don't write upper bounds for Alex nor Happy because the
   -- `build-tool-depends` field can not be modified in Hackage.

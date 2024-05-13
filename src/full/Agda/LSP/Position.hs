@@ -1,4 +1,3 @@
-{-# LANGUAGE OverloadedLabels #-}
 module Agda.LSP.Position
   ( PosDelta
   , changeToDelta
@@ -8,9 +7,11 @@ module Agda.LSP.Position
 import Control.Monad
 
 import qualified Data.Text as T
-import Data.Row.Records
 
 import Language.LSP.Protocol.Types as Lsp
+import Language.LSP.Protocol.Lens
+
+import Agda.Utils.Lens
 
 data Result a
   = RangeR a a
@@ -110,7 +111,7 @@ fromCurrent (Range start@(Position startLine startColumn) end@(Position endLine 
 
 changeToDelta :: TextDocumentContentChangeEvent -> PosDelta
 changeToDelta (TextDocumentContentChangeEvent (InL x)) =
-  PosDelta (toCurrent (x .! #range) (x .! #text)) (fromCurrent (x .! #range) (x .! #text))
+  PosDelta (toCurrent (x ^. range) (x ^. text)) (fromCurrent (x ^. range) (x ^. text))
 changeToDelta _ = mempty
 
 
