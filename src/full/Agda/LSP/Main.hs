@@ -1,6 +1,5 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE RecursiveDo #-}
-{-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE NondecreasingIndentation #-}
 module Agda.LSP.Main (runAgdaLSP) where
@@ -35,6 +34,7 @@ import Data.IORef
 import Data.Coerce
 import Data.Maybe
 import Data.List (find, sortOn, intercalate)
+import Data.Char (isSpace)
 
 import GHC.Generics
 
@@ -83,6 +83,7 @@ import Agda.Interaction.BasicOps (getWarningsAndNonFatalErrors, normalForm)
 import Agda.Interaction.JSONTop () -- Instances only
 
 import qualified Agda.Utils.RangeMap as RangeMap
+import Agda.Utils.RangeMap (RangeMap)
 import qualified Agda.Utils.BiMap as BiMap
 
 import Agda.Utils.Impossible
@@ -93,8 +94,6 @@ import Agda.Syntax.Parser (runPMIO)
 import Agda.Mimer.Mimer as Mimer
 import qualified Agda.Syntax.Parser as P
 import qualified Agda.Utils.Maybe.Strict as Strict
-import qualified Agda.Utils.RangeMap as RangeMap
-import Agda.Utils.RangeMap (RangeMap)
 import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
 import Agda.Syntax.Common (InteractionId)
 import Agda.Syntax.Fixity (Precedence(TopCtx))
@@ -105,7 +104,8 @@ import Agda.LSP.Commands
 import Agda.LSP.Output (Printed(Printed), renderToJSON)
 import Agda.Interaction.InteractionTop (highlightExpr)
 import Agda.Interaction.Highlighting.Range (rangeToRange)
-import Data.Char (isSpace)
+import Agda.Interaction.Options.Lenses
+import Agda.Interaction.Options
 
 syncOptions :: TextDocumentSyncOptions
 syncOptions = TextDocumentSyncOptions
@@ -154,10 +154,14 @@ lspInit
 lspInit setup config _ = do
   workers  <- newMVar mempty
 
+  (opts, _) <- runTCM initEnv initState do
+    setup
+    commandLineOptions
+
   pure $ Right LspState
     { lspStateConfig  = config
     , lspStateWorkers = workers
-    , lspStateSetup   = setup
+    , lspStateOptions = opts { optAbsoluteIncludePaths = [] }
     }
 
 lspDebug :: MonadLsp cfg m => String -> m ()
@@ -192,7 +196,6 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
                     }
 
               task' = do
-                lspStateSetup state
                 setInteractionOutputCallback (lspOutputCallback uri (lspStateConfig state))
                 conf <- liftIO (run getConfig)
                 locallyTC eHighlightingLevel (const (lspHighlightingLevel conf)) do
@@ -210,6 +213,7 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
               , workerThread      = wthread
               , workerTasks       = chan
               , workerContext     = lspStateConfig state
+              , workerOptions     = lspStateOptions state
               , workerPosDelta    = deltas
               }
 
@@ -281,9 +285,27 @@ toDiagnostic x = do
     , _data_              = Nothing
     }
 
+
+-- Reset the TC state inside a task.
+resetTCState :: Task ()
+resetTCState = do
+  opts <- getInitialOptions
+  root <- getRootPath
+
+  liftTCM do
+    resetState
+
+    opts <- addTrustedExecutables opts
+    case root of
+      Nothing -> I.setCommandLineOptions opts
+      Just path -> do
+        absPath <- liftIO $ absolute path
+        I.setCommandLineOptions' absPath opts
+
 reloadURI :: Task ()
 reloadURI = do
-  liftTCM resetState
+  resetTCState
+
   modifyDelta (const mempty)
   diagnoseTCM []
 
@@ -534,10 +556,6 @@ completion = requestHandlerTCM SMethod_TextDocumentCompletion (view (params . te
     reportSLn "lsp.completion" 10 $ show req
     res (Right (InL (catMaybes comp ++ catMaybes comp')))
 
-
-runLspTCM :: (?worker :: Worker) => NormalizedUri -> TCM (Maybe VirtualFile)
-runLspTCM uri = liftIO $ runLspT (workerContext ?worker) (getVirtualFile uri)
-
 onTypeFormatting :: Handlers WorkerM
 onTypeFormatting = requestHandler SMethod_TextDocumentOnTypeFormatting \req res -> do
   text <- fmap virtualFileText <$> getVirtualFile (toNormalizedUri (req ^. params . textDocument . uri))
@@ -773,3 +791,7 @@ lspHandlers caps = mconcat
   , getCodeActions
   , executeAgdaCommand
   ]
+
+tryError :: MonadError e m => m a -> m (Either e a)
+tryError = (`catchError` pure . Left) . fmap Right
+

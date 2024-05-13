@@ -7,6 +7,7 @@ import Control.Concurrent.MVar
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
 import Control.Monad.Except
+import Control.Applicative (liftA2)
 import Control.Concurrent
 import Control.Monad
 
@@ -34,6 +35,7 @@ import qualified Agda.Utils.BiMap as BiMap
 
 import Agda.LSP.Position
 import Agda.Interaction.FindFile (SourceFile(..))
+import Agda.Interaction.Options
 import Agda.Utils.FileName (absolute)
 import Agda.Utils.Null
 import Data.String
@@ -41,7 +43,6 @@ import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Functor
 import Agda.Utils.Maybe (fromMaybe)
 import Agda.LSP.Translation (rangeContains)
-import GHC.Compact
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -73,13 +74,15 @@ data Worker = Worker
 
   , workerContext     :: LanguageContextEnv LspConfig
 
+  , workerOptions     :: CommandLineOptions
+
   , workerPosDelta    :: !(MVar PosDelta)
   }
 
 data LspState = LspState
   { lspStateConfig  :: LanguageContextEnv LspConfig
   , lspStateWorkers :: MVar (HashMap NormalizedUri Worker)
-  , lspStateSetup   :: TCM ()
+  , lspStateOptions :: CommandLineOptions
   }
 
 newtype WorkerM a = WorkerM { unWorkerM :: ReaderT LspState IO a }
@@ -128,6 +131,9 @@ theSourceFile = do
 
 theURI :: Task Uri
 theURI = Task (asks (fromNormalizedUri . workerUri))
+
+getInitialOptions :: Task CommandLineOptions
+getInitialOptions = Task (asks workerOptions)
 
 findInteractionPoint :: Lsp.Position -> Task (Maybe (InteractionId, InteractionPoint))
 findInteractionPoint pos = do
