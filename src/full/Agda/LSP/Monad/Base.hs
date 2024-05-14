@@ -12,10 +12,11 @@ import Control.Concurrent
 import Control.Monad
 
 import qualified Data.HashMap.Strict as HashMap
-import qualified Data.IntMap.Strict as IntMap
+import qualified Data.Map.Strict as Map
 import Data.HashMap.Strict (HashMap)
-import Data.IntMap.Strict (IntMap)
-import Data.Dynamic
+import Data.Map.Strict (Map)
+import Data.Default
+import Data.Monoid
 
 import Data.Aeson
 import Data.IORef
@@ -25,8 +26,10 @@ import GHC.Generics
 
 import qualified Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Types (NormalizedUri, Uri, fromNormalizedUri)
+import Language.LSP.Protocol.Lens (start, end)
 import Language.LSP.Server
 
+import Agda.Syntax.Position
 import Agda.Syntax.Common
 
 import Agda.TypeChecking.Monad
@@ -41,8 +44,11 @@ import Agda.Utils.Null
 import Data.String
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Functor
-import Agda.Utils.Maybe (fromMaybe)
-import Agda.LSP.Translation (rangeContains)
+import Agda.Utils.Maybe (fromMaybe, mapMaybe)
+import Agda.Utils.Lens
+import Agda.LSP.Translation
+
+import qualified Debug.Trace as DT
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel
@@ -56,6 +62,14 @@ initLspConfig :: LspConfig
 initLspConfig = LspConfig
   { lspHighlightingLevel = NonInteractive
   }
+
+data PositionInfo = PositionInfo
+  { posInfoDelta        :: PosDelta
+  , posInfoInteractions :: [Lsp.Range]
+  }
+
+instance Default PositionInfo where
+  def = PositionInfo mempty def
 
 data Worker = Worker
   { workerUri         :: !NormalizedUri
@@ -76,7 +90,7 @@ data Worker = Worker
 
   , workerOptions     :: CommandLineOptions
 
-  , workerPosDelta    :: !(MVar PosDelta)
+  , workerPosInfo     :: !(MVar PositionInfo)
   }
 
 data LspState = LspState
@@ -116,13 +130,21 @@ instance {-# OVERLAPPABLE #-} Null a => Null (Task a) where
   empty = return empty
   null  = __IMPOSSIBLE__
 
+getPositionInfo :: Task PositionInfo
+getPositionInfo = liftIO . readMVar =<< Task (asks workerPosInfo)
+
 getDelta :: Task PosDelta
-getDelta = liftIO . readMVar =<< Task (asks workerPosDelta)
+getDelta = posInfoDelta <$> getPositionInfo
 
 modifyDelta :: (PosDelta -> PosDelta) -> Task ()
 modifyDelta k = do
-  delta <- Task (asks workerPosDelta)
-  liftIO $ modifyMVar_ delta (pure . k)
+  info <- Task (asks workerPosInfo)
+  liftIO $ modifyMVar_ info (pure . \x -> x { posInfoDelta = k $ posInfoDelta x  })
+
+setInteractionPointRanges :: [Lsp.Range] -> Task ()
+setInteractionPointRanges i = do
+  info <- Task (asks workerPosInfo)
+  liftIO $ modifyMVar_ info (pure . \x -> x { posInfoInteractions = i })
 
 theSourceFile :: Task SourceFile
 theSourceFile = do
@@ -135,17 +157,43 @@ theURI = Task (asks (fromNormalizedUri . workerUri))
 getInitialOptions :: Task CommandLineOptions
 getInitialOptions = Task (asks workerOptions)
 
-findInteractionPoint :: Lsp.Position -> Task (Maybe (InteractionId, InteractionPoint))
-findInteractionPoint pos = do
-  ii <- useR stInteractionPoints
-  delta <- getDelta
+-- | Attempt to get the position of an interaction point, updated to the latest
+-- position in the document.
+getCurrentInteractionRange :: PositionInfo -> InteractionPoint -> Maybe Lsp.Range
+getCurrentInteractionRange posInfo ip = do
+  ival <- rangeToInterval (ipRange ip)
   let
-    go (_, ip) = not (ipSolved ip) && rangeContains delta pos (ipRange ip)
-  pure $ find go (BiMap.toList ii)
+    delta = posInfoDelta posInfo
+    s = updatePosition delta (toLsp (iStart ival))
+    e = updatePosition delta (toLsp (iEnd ival))
+  case (s, e) of
+    (Just s, Just e) -> Just (Lsp.Range s e)
+    (Nothing, Nothing) -> Nothing
+    (Just s, Nothing) -> find ((== s) . view start) (posInfoInteractions posInfo)
+    (Nothing, Just e) -> find ((== e) . view end) (posInfoInteractions posInfo)
+
+type InteractionPointInfo = (InteractionId, InteractionPoint, Lsp.Range)
+
+-- | Get all interaction points in the current file, along with their range.
+getActiveInteractionPoints :: Task [InteractionPointInfo]
+getActiveInteractionPoints  = do
+  ii <- useR stInteractionPoints
+  posInfo <- getPositionInfo
+
+  let
+    go (ii, ip)
+      | ipSolved ip = Nothing
+      | otherwise = (ii, ip, ) <$> getCurrentInteractionRange posInfo ip
+
+  pure . mapMaybe go $ BiMap.toList ii
+
+-- | Find an active interaction point at the cursor.
+findInteractionPoint :: Lsp.Position -> Task (Maybe InteractionPointInfo)
+findInteractionPoint pos = find (\(_, _, r) -> Lsp.positionInRange pos r) <$> getActiveInteractionPoints
 
 withPosition :: Lsp.Position -> (InteractionPoint -> Task a) -> Task (Maybe a)
 withPosition pos cont = do
   containing <- findInteractionPoint pos
   case containing of
-    Just (iid, ip) -> Just <$> withInteractionId iid (cont ip)
+    Just (iid, ip, _) -> Just <$> withInteractionId iid (cont ip)
     Nothing -> pure Nothing

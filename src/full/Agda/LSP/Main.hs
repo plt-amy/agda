@@ -69,6 +69,9 @@ import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Monad as I
 
+import qualified Agda.Syntax.Parser as Pa
+import qualified Agda.Syntax.Parser.Tokens as T
+
 import Agda.LSP.Translation
 import Agda.LSP.Position
 import Agda.LSP.Goal
@@ -78,13 +81,14 @@ import qualified Agda.Interaction.BasicOps as B
 import Agda.Interaction.Highlighting.Precise
 import Agda.Interaction.Highlighting.Common (toAtoms)
 import Agda.Interaction.Response.Base
-import Agda.Interaction.FindFile (SourceFile(SourceFile))
+import Agda.Interaction.FindFile (SourceFile(..))
 import Agda.Interaction.BasicOps (getWarningsAndNonFatalErrors, normalForm)
 import Agda.Interaction.JSONTop () -- Instances only
 
 import qualified Agda.Utils.RangeMap as RangeMap
 import Agda.Utils.RangeMap (RangeMap)
 import qualified Agda.Utils.BiMap as BiMap
+import Agda.Utils.Tuple (fst3)
 
 import Agda.Utils.Impossible
 import Agda.Utils.FileName
@@ -177,7 +181,7 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
 
       Nothing -> do
         lock   <- newMVar =<< newIORef initState
-        deltas <- newMVar mempty
+        deltas <- newMVar def
         chan   <- newChan
 
         rec
@@ -214,7 +218,7 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
               , workerTasks       = chan
               , workerContext     = lspStateConfig state
               , workerOptions     = lspStateOptions state
-              , workerPosDelta    = deltas
+              , workerPosInfo     = deltas
               }
 
         run $ lspDebug $ "Spawned worker " <> show (workerThread worker) <> " to manage file " <> fp
@@ -247,6 +251,15 @@ onTextDocumentChange = notificationHandler SMethod_TextDocumentDidChange \notif 
     -- Important: mappend for PosDelta is *applicative order*, so this
     -- means "first apply the old diff, then apply the new diff".
     new `seq` (new <> old)
+
+  path <- theSourceFile
+  text <- maybe "" virtualFileText <$> getVirtualFile (toNormalizedUri (notif ^. params . textDocument . uri))
+  (parseResult, _) <- liftIO . Pa.runPMIO $ Pa.parseFile Pa.tokensParser (RangeFile (srcFilePath path) Nothing) (Text.unpack text)
+  setInteractionPointRanges
+    . foldMap (\case
+        TokSymbol SymQuestionMark ival -> [toLsp ival]
+        _ -> mempty)
+    $ either (const []) (fst . fst) parseResult
 
 onTextDocumentClosed :: Handlers WorkerM
 onTextDocumentClosed = notificationHandler SMethod_TextDocumentDidClose \notif ->
@@ -384,15 +397,12 @@ getFileSubstring file (Lsp.Range (Lsp.Position sL sC) (Lsp.Position eL eC)) =
   in
   Rope.toText main
 
--- | Get the current/latest range of the current interaction point.
-interactionRange :: PosDelta -> InteractionPoint -> Maybe Lsp.Range
-interactionRange delta ip = rangeToInterval (ipRange ip) >>= updatePosition delta . toLsp
-
 -- | Get the contents of an interaction point, if still present in the document.
-interactionContents :: PosDelta -> Agda.Range -> VirtualFile -> Maybe (Agda.Range, Text.Text)
-interactionContents delta range file = do
-  lrange <- updatePosition delta (toLsp range)
+interactionContents :: InteractionPointInfo -> VirtualFile -> Maybe (Agda.Range, Text.Text)
+interactionContents (_, ip, lrange) file = do
   contents <- Text.stripPrefix "{!" <=< Text.stripSuffix "!}" $ getFileSubstring file lrange
+
+  let range = ipRange ip
   Interval is ie <- rangeToInterval range
   let
     (spaces, text) = Text.span isSpace contents
@@ -412,17 +422,17 @@ printedTerm rewr ty = do
   abstractToConcreteCtx TopCtx =<< reify ty
 
 fillQuery :: Query a -> Task a
-fillQuery (Query_GoalAt pos) = fmap fst <$> findInteractionPoint pos
+fillQuery (Query_GoalAt pos) = fmap fst3 <$> findInteractionPoint pos
 
 fillQuery Query_AllGoals = do
-  iis <- useR stInteractionPoints
-  forM (BiMap.toList iis) \(id, ip) -> withInteractionId id do
+  iis <- getActiveInteractionPoints
+  forM iis \(id, ip, range) -> withInteractionId id do
     mi <- lookupInteractionId id
     ty <- fmap Printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
     pure Goal
       { goalId    = id
       , goalType  = ty
-      , goalRange = toLsp (ipRange ip)
+      , goalRange = range
       }
 
 fillQuery (Query_GoalInfo iid) = withInteractionId iid do
@@ -449,7 +459,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
   gty <- fmap Printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
   locals <- catMaybes <$> forM locals mkVar
   pure GoalInfo
-    { goalGoal    = Goal iid (toLsp (ipRange ip)) gty
+    { goalGoal    = Goal iid (toLsp (ipRange ip)) gty -- TODO: Remap position.
     , goalContext = locals
     }
 
@@ -646,24 +656,21 @@ getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params 
   let fileUri = req ^. params . textDocument . uri
   reportSLn "lsp.codeAction" 10 $ show req
 
-  ii <- useR stInteractionPoints
-  delta <- getDelta
+  ii <- getActiveInteractionPoints
   virtualFile <- getVirtualFile $ toNormalizedUri fileUri
 
   let
     reqRange@(Lsp.Range reqStart reqEnd) = req ^. params . range
 
-    resolveInteraction ip = do
-      range <- interactionRange delta ip
-      (_, contents) <- interactionContents delta (ipRange ip) =<< virtualFile
+    resolveInteraction i@(_, ip, range) = do
+      (_, contents) <- interactionContents i =<< virtualFile
       pure (range, not (Text.null contents))
 
     -- Determine if this interaction point overlaps with the provided range
     -- at all
-    containing =
-      filter (\(Lsp.Range iS iE, _) -> iE >= reqStart && iS <= reqEnd)
-        . mapMaybe resolveInteraction
-        $ BiMap.elems ii
+    containing
+      = mapMaybe resolveInteraction
+      $ filter (\(_, _, Lsp.Range iS iE) -> iE >= reqStart && iS <= reqEnd) ii
 
   res . Right $ case containing of
     [] -> InL []
@@ -701,19 +708,17 @@ commandHandlerInteractionPoint
   :: Uri
   -> Lsp.Position
   -> (Either ResponseError (Value |? Null) -> WorkerM ())
-  -> (InteractionId -> InteractionPoint -> Lsp.Range -> (Agda.Range, Text.Text)
+  -> (InteractionPointInfo -> (Agda.Range, Text.Text)
     -> Task (Either ResponseError (Value |? Null)))
   -> WorkerM ()
 commandHandlerInteractionPoint uri pos res cont = commandHandlerTCM uri res \run -> do
   pos <- findInteractionPoint pos
   virtualFile <- liftIO . run . getVirtualFile $ toNormalizedUri uri
-  delta <- getDelta
 
   case pos of
-    Just (ii , ip)
-      | Just range <- interactionRange delta ip
-      , Just contents <- interactionContents delta (ipRange ip) =<< virtualFile
-      -> cont ii ip range contents
+    Just i
+      | Just contents <- interactionContents i =<< virtualFile
+      -> cont i contents
 
     _ -> pure . Left $
       ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot find interaction at this point" Nothing
@@ -725,7 +730,7 @@ executeAgdaCommand :: Handlers WorkerM
 executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
   case parseCommand (req ^. params . command) (fromMaybe [] (req ^. params . arguments)) of
     Nothing -> res (Left (ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot parse command" Nothing))
-    Just (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \ii ip range (inner, contents) -> do
+    Just (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, contents) -> do
       -- TODO: What's the proper range here? This gets passed from the elisp side, so
       -- I think it's the *inside* of the interaction point, after edits have been applied.
       result <- Mimer.mimer ii inner (Text.unpack contents)
@@ -739,7 +744,7 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
 
       pure (Right (InR Lsp.Null))
 
-    Just (Command_Give uri pos) -> commandHandlerInteractionPoint uri pos res \ii ip range (inner, contents) -> do
+    Just (Command_Give uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, contents) -> do
       scope <- getInteractionScope ii
 
       (given, res) <- liftTCM do
