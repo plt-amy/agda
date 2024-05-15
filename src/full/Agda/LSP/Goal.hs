@@ -8,14 +8,17 @@ import GHC.Generics
 
 import qualified Agda.Syntax.Concrete as C
 import qualified Agda.Syntax.Abstract as A
-import Agda.Syntax.Common.Pretty (Pretty)
+import Agda.Syntax.Concrete.Pretty ()
+import Agda.Syntax.Common.Pretty
 import Agda.Syntax.Internal
 import Agda.Syntax.Common
 
 import Agda.TypeChecking.Monad
 
+import Agda.Interaction.BasicOps ()
 import Agda.Interaction.Base (Rewrite)
-import Agda.TypeChecking.Pretty
+
+import Agda.TypeChecking.Pretty ()
 import Agda.Interaction.JSON
 
 import Agda.LSP.Monad.Base
@@ -36,26 +39,74 @@ data SomeQuery where
 deriving instance Show SomeQuery
 
 data Goal = Goal
-  { goalId    :: InteractionId
-  , goalRange :: Range
-  , goalType  :: Printed C.Expr
+  { goalId       :: InteractionId
+  , goalRange    :: Range
+  , goalType     :: Printed C.Expr
   }
   deriving (Show, Generic)
 
 instance ToJSON Goal
 
-data Local = Local
-  { localName        :: Printed C.Name
-  , localReifiedName :: Printed C.Name
-  , localType        :: Printed C.Expr
+data ReifiedName = ReifiedName
+  { reifiedNameActual :: C.Name
+  , reifiedName       :: C.Name
   }
   deriving (Show, Generic)
+
+instance Pretty ReifiedName where
+  pretty (ReifiedName n x)
+    | n == x                     = pretty x
+    | C.isInScope n == C.InScope = pretty n
+    | otherwise                  = pretty x
+
+data Binder = Binder
+  { binderName    :: ReifiedName
+  , binderType    :: C.Expr
+  , binderIsValue :: Bool
+  }
+  deriving (Show, Generic)
+
+instance Pretty Binder where
+  pretty (Binder name expr islet) = sep [ pretty name <+> sym, nest 2 (pretty expr) ] where
+    sym | islet     = equals
+        | otherwise = colon
+
+data Local = Local
+  { localBinder      :: Printed Binder
+  , localBindingSite :: Maybe Lsp.Range
+  , localValue       :: Maybe (Printed Binder)
+  , localInScope     :: Bool
+  , localHiding      :: Hiding
+  , localModality    :: Modality
+  }
+  deriving (Show, Generic)
+
+instance ToJSON Relevance where
+  toJSON = toJSON . show
+
+instance ToJSON Quantity where
+  toJSON = \case
+    Quantity0{} -> "0"
+    Quantity1{} -> "1"
+    Quantityω{} -> "ω"
+
+instance ToJSON Cohesion where
+  toJSON = toJSON . show
+
+instance ToJSON Modality
+
+instance ToJSON Hiding where
+  toJSON = \case
+    Hidden      -> "Hidden"
+    Instance{}  -> "Instance"
+    NotHidden{} -> "NotHidden"
 
 instance ToJSON Local
 
 data GoalInfo = GoalInfo
-  { goalGoal    :: Goal
-  , goalContext :: [Local]
+  { goalGoal     :: Goal
+  , goalContext  :: [Local]
+  , goalBoundary :: Maybe [Printed (IPFace' C.Expr)]
   }
   deriving (Show, Generic)
 

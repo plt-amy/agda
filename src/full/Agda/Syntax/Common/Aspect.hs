@@ -125,7 +125,7 @@ data Aspects = Aspects
     -- ^ The definition site of the annotated thing, if applicable and
     --   known.
   , aspectRange :: Range
-  , tokenBased :: !TokenBased
+  , tokenBased  :: !TokenBased
     -- ^ Is this entry token-based?
   }
   deriving (Show, Generic)

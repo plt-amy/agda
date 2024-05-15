@@ -8,7 +8,7 @@ import Control.Monad.Trans.Maybe
 import Control.Monad.IO.Class
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
-import Control.Monad.Except
+import Control.Monad.Except hiding (tryError)
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
@@ -29,9 +29,9 @@ import Data.Strict.Tuple (Pair(..))
 import Data.Aeson.Types as Aeson
 import Data.Foldable
 import Data.Default
+import Data.Coerce
 import Data.Proxy
 import Data.IORef
-import Data.Coerce
 import Data.Maybe
 import Data.List (find, sortOn, intercalate)
 import Data.Char (isSpace)
@@ -99,7 +99,7 @@ import Agda.Mimer.Mimer as Mimer
 import qualified Agda.Syntax.Parser as P
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
-import Agda.Syntax.Common (InteractionId)
+import Agda.Syntax.Common (InteractionId, LensModality (getModality), LensHiding (getHiding))
 import Agda.Syntax.Fixity (Precedence(TopCtx))
 import Agda.Interaction.Base (Rewrite(AsIs), UseForce (WithoutForce))
 
@@ -326,6 +326,7 @@ reloadURI = do
   src <- liftTCM $ Imp.parseSource sf
   cr <- liftTCM $ Imp.typeCheckMain Imp.TypeCheck src
   void $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
+  sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/infoview/refresh")) . toJSON =<< theURI
 
   unless (null (Imp.crWarnings cr)) do
     WarningsAndNonFatalErrors warn err <- liftTCM $ getWarningsAndNonFatalErrors
@@ -430,37 +431,74 @@ fillQuery Query_AllGoals = do
     mi <- lookupInteractionId id
     ty <- fmap Printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
     pure Goal
-      { goalId    = id
-      , goalType  = ty
-      , goalRange = range
+      { goalId       = id
+      , goalType     = ty
+      , goalRange    = range
       }
 
 fillQuery (Query_GoalInfo iid) = withInteractionId iid do
   mi <- lookupInteractionId iid
   ip <- lookupInteractionPoint iid
+  delta <- getDelta
 
   let
     mkVar :: ContextEntry -> Task (Maybe Local)
     mkVar Dom{ domInfo = ai, unDom = (name, t) } = do
       -- if shouldHide ai name then return Nothing else Just <$> do
-        let n = nameConcrete name
-        x <- abstractToConcrete_ name
-        let s = C.isInScope x
-        -- ty <- allocForeignCl t
-        con <- abstractToConcreteCtx TopCtx =<< reify (unEl t)
-        pure $ Just Local
-          { localName        = Printed n
-          , localReifiedName = Printed x
-          , localType        = Printed con
-          }
+      let n = nameConcrete name
+      x <- abstractToConcrete_ name
+
+      let s = C.isInScope x
+      -- ty <- allocForeignCl t
+      con <- abstractToConcreteCtx TopCtx =<< reify (unEl t)
+
+      pure $ Just Local
+        { localBinder      = Printed (Binder (ReifiedName n x) con False)
+        , localValue       = Nothing
+        , localBindingSite = updatePosition delta (toLsp (nameBindingSite name))
+        , localInScope     = s == C.InScope
+        , localHiding      = getHiding ai
+        , localModality    = getModality ai
+        }
+
+    mkLet :: (Name, Open I.LetBinding) -> Task (Maybe Local)
+    mkLet (name, lb) = do
+      LetBinding _ tm !dom <- getOpen lb
+      let n = nameConcrete name
+      x  <- abstractToConcrete_ name
+      let s = C.isInScope x
+      ty <- liftTCM (abstractToConcreteCtx TopCtx =<< reifyUnblocked =<< normalForm AsIs (unDom dom))
+            -- Remove let bindings from x and later, to avoid folding to x = x, or using bindings
+            -- not introduced when x was defined.
+      v <- abstractToConcreteCtx TopCtx =<< liftTCM (removeLetBindingsFrom name (reifyUnblocked =<< normalForm AsIs tm))
+
+      pure $ Just Local
+        { localBinder      = Printed (Binder (ReifiedName n x) ty False)
+        , localBindingSite = updatePosition delta (toLsp (nameBindingSite name))
+        , localValue       = Just (Printed (Binder (ReifiedName n x) v True))
+        , localInScope     = s == C.InScope
+        , localHiding      = getHiding (domInfo dom)
+        , localModality    = getModality (domInfo dom)
+        }
+
+
+  gty <- fmap Printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
 
   ctx <- getContext
   let locals = zipWith raise [1..] ctx
-  gty <- fmap Printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
   locals <- catMaybes <$> forM locals mkVar
+
+  lets <- Map.toAscList <$> asksTC envLetBindings
+  lets <- catMaybes <$> forM lets mkLet
+
+  boundary <- liftTCM $ B.getIPBoundary AsIs iid
+
   pure GoalInfo
-    { goalGoal    = Goal iid (toLsp (ipRange ip)) gty -- TODO: Remap position.
-    , goalContext = locals
+    { goalGoal     = Goal iid (toLsp (ipRange ip)) gty -- TODO: Remap position.
+    , goalContext  = lets ++ locals
+    , goalBoundary = case boundary of
+        [] -> Nothing
+        xs -> Just $! map Printed xs
     }
 
 goal :: Handlers WorkerM
@@ -799,4 +837,3 @@ lspHandlers caps = mconcat
 
 tryError :: MonadError e m => m a -> m (Either e a)
 tryError = (`catchError` pure . Left) . fmap Right
-
