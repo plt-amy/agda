@@ -48,7 +48,6 @@ import Agda.Syntax.Position
 import Agda.Utils.Impossible
 import Agda.Utils.FileName
 
-
 -- * Pretty class
 
 -- | The type of documents. We use documents annotated by 'Aspects' to
