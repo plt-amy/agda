@@ -54,3 +54,6 @@ newtype Printed a = Printed { getPrinted :: a }
 
 instance Pretty a => ToJSON (Printed a) where
   toJSON = renderToJSON . pretty . getPrinted
+
+instance Pretty a => Show (Printed a) where
+  show = render . pretty . getPrinted
