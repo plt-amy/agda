@@ -4,10 +4,6 @@ module Agda.LSP.Goal where
 import qualified Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Types
 
-import Data.Aeson.Types
-import Data.Function
-import Data.Aeson
-
 import GHC.Generics
 
 import qualified Agda.Syntax.Concrete as C
@@ -44,7 +40,7 @@ data Goal = Goal
   , goalRange :: Range
   , goalType  :: Printed C.Expr
   }
-  deriving (Generic)
+  deriving (Show, Generic)
 
 instance ToJSON Goal
 
@@ -53,7 +49,7 @@ data Local = Local
   , localReifiedName :: Printed C.Name
   , localType        :: Printed C.Expr
   }
-  deriving (Generic)
+  deriving (Show, Generic)
 
 instance ToJSON Local
 
@@ -61,7 +57,7 @@ data GoalInfo = GoalInfo
   { goalGoal    :: Goal
   , goalContext :: [Local]
   }
-  deriving (Generic)
+  deriving (Show, Generic)
 
 instance ToJSON GoalInfo
 
@@ -73,6 +69,17 @@ instance FromJSON SomeQuery where
       "GoalInfo" -> SomeQuery uri <$> (Query_GoalInfo <$> obj .: "goal")
       "AllGoals" -> pure $ SomeQuery uri Query_AllGoals
       _ -> fail "Unknown query kind"
+
+instance ToJSON SomeQuery where
+  toJSON (SomeQuery uri query) =
+    let
+      kind :: String
+      (kind, rest) = case query of
+        Query_GoalAt pos -> ("GoalAt", ["position" .= toJSON pos])
+        Query_GoalInfo iid -> ("GoalInfo", ["goal" .= toJSON iid])
+        Query_AllGoals -> ("AllGoals", [])
+    in
+    object ("uri" .= toJSON uri : "kind" .= toJSON kind : rest)
 
 -- data GoalResponse a
 --   = AllGoals
