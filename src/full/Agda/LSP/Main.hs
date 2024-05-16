@@ -732,17 +732,17 @@ getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params 
   res . Right $ case containing of
     [] -> InL []
     [(range, nonEmpty)] -> InL $
-      [ InR $ makeCodeAction "Run proof search on this goal" (Command_Auto fileUri (range ^. start)) ] ++
-      [ InR $ makeCodeAction "Fill goal with current contents" (Command_Give fileUri (range ^. start)) | nonEmpty ] ++
-      [ InR $ makeCodeAction "Refine goal" (Command_Refine fileUri (range ^. start)) | nonEmpty ] ++
-      [ InR $ makeCodeAction "Introduce term" (Command_Intro fileUri (range ^. start)) | not nonEmpty ]
+      [ InR $ makeCodeAction "Run proof search on this goal" "agda.auto" (Command_Auto fileUri (range ^. start)) ] ++
+      [ InR $ makeCodeAction "Fill goal with current contents" "agda.give" (Command_Give fileUri (range ^. start)) | nonEmpty ] ++
+      [ InR $ makeCodeAction "Refine goal" "agda.refine" (Command_Refine fileUri (range ^. start)) | nonEmpty ] ++
+      [ InR $ makeCodeAction "Introduce term" "agda.refine" (Command_Intro fileUri (range ^. start)) | not nonEmpty ]
     _ -> InL []
 
   where
-      makeCodeAction title command =
+      makeCodeAction title kind command =
         CodeAction
         { _title = title
-        , _kind = Just CodeActionKind_QuickFix
+        , _kind = Just (CodeActionKind_Custom kind)
         , _diagnostics = Nothing
         , _isPreferred = Nothing
         , _disabled = Nothing
