@@ -7,7 +7,7 @@ import Control.Concurrent.MVar
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
 import Control.Monad.Except
-import Control.Applicative (liftA2)
+import Control.Applicative (liftA2, (<|>))
 import Control.Concurrent
 import Control.Monad
 
@@ -15,8 +15,7 @@ import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Map.Strict as Map
 import Data.HashMap.Strict (HashMap)
 import Data.Map.Strict (Map)
-import Data.Default
-import Data.Monoid
+import Data.Text (Text)
 
 import Data.Aeson
 import Data.IORef
@@ -27,6 +26,7 @@ import GHC.Generics
 import qualified Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Types (NormalizedUri, Uri, fromNormalizedUri)
 import Language.LSP.Protocol.Lens (start, end)
+import Language.LSP.VFS (VirtualFile)
 import Language.LSP.Server
 
 import Agda.Syntax.Position
@@ -68,9 +68,6 @@ data PositionInfo = PositionInfo
   , posInfoInteractions :: [Lsp.Range]
   }
 
-instance Default PositionInfo where
-  def = PositionInfo mempty def
-
 data Worker = Worker
   { workerUri         :: !NormalizedUri
     -- ^ URI managed by this worker.
@@ -91,6 +88,14 @@ data Worker = Worker
   , workerOptions     :: CommandLineOptions
 
   , workerPosInfo     :: !(MVar PositionInfo)
+  , workerSnapshot    :: !(MVar (Maybe StateSnapshot))
+  }
+
+-- | A snapshot of the current editing state.
+data StateSnapshot = StateSnapshot
+  { snapshotText     :: Text
+  , snapshotTc       :: TCState
+  , snapshotPosition :: PosDelta
   }
 
 data LspState = LspState
@@ -154,8 +159,21 @@ theSourceFile = do
 theURI :: Task Uri
 theURI = Task (asks (fromNormalizedUri . workerUri))
 
+theVirtualFile :: Task (Maybe VirtualFile)
+theVirtualFile = getVirtualFile . Lsp.toNormalizedUri =<< theURI
+
 getInitialOptions :: Task CommandLineOptions
 getInitialOptions = Task (asks workerOptions)
+
+takeSnapshot :: Task (Maybe StateSnapshot)
+takeSnapshot = do
+  info <- Task (asks workerSnapshot)
+  liftIO $ modifyMVar info (pure . (Nothing, ))
+
+setSnapshot :: Maybe StateSnapshot -> Task ()
+setSnapshot snapshot = do
+  info <- Task (asks workerSnapshot)
+  liftIO $ modifyMVar_ info (pure . const snapshot)
 
 -- | Attempt to get the position of an interaction point, updated to the latest
 -- position in the document.
@@ -164,13 +182,13 @@ getCurrentInteractionRange posInfo ip = do
   ival <- rangeToInterval (ipRange ip)
   let
     delta = posInfoDelta posInfo
-    s = updatePosition delta (toLsp (iStart ival))
-    e = updatePosition delta (toLsp (iEnd ival))
-  case (s, e) of
-    (Just s, Just e) -> Just (Lsp.Range s e)
-    (Nothing, Nothing) -> Nothing
-    (Just s, Nothing) -> find ((== s) . view start) (posInfoInteractions posInfo)
-    (Nothing, Just e) -> find ((== e) . view end) (posInfoInteractions posInfo)
+    s = toUpdatedPosition delta (iStart ival)
+    e = toUpdatedPosition delta (iEnd ival)
+  pointAt s <|> pointAt e
+
+  where
+    pointAt Nothing = Nothing
+    pointAt (Just x) = find ((== x) . view end) (posInfoInteractions posInfo)
 
 type InteractionPointInfo = (InteractionId, InteractionPoint, Lsp.Range)
 

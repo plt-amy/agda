@@ -6,17 +6,17 @@ import Data.Function
 import Data.Maybe
 import Data.Aeson (ToJSON)
 
+import Control.Monad (guard)
+
 import qualified Language.LSP.Protocol.Types as Lsp
 import qualified Language.LSP.Protocol.Lens as Lsp
-
-import GHC.Generics
 
 import Agda.Syntax.Common.Pretty
 import Agda.Syntax.Position
 
 import Agda.TypeChecking.Monad.Base
 import Agda.TypeChecking.Pretty
-import Agda.TypeChecking.Errors
+import Agda.TypeChecking.Errors ()
 
 import qualified Agda.Interaction.Highlighting.Range as Hl
 import qualified Agda.Utils.RangeMap as RangeMap
@@ -27,8 +27,7 @@ import Agda.Syntax.Common.Aspect as Asp
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.FileName (filePath)
 import Agda.Syntax.Abstract.Name (Name(nameBindingSite), qnameName)
-import Agda.LSP.Position (PosDelta, updatePosition, Positionable (downgradePosition))
-import Control.Monad (guard)
+import Agda.LSP.Position
 
 class ToLsp a where
   type LspType a
@@ -136,35 +135,29 @@ agdaTokenLegend = Lsp.SemanticTokensLegend
   }
 
 aspectMapToTokens :: PosDelta -> RangeMap Aspects -> [Lsp.SemanticTokenAbsolute]
-aspectMapToTokens delta = concatMap go . RangeMap.toList where
-  go (_, asp@Aspects{aspectRange = range}) | range /= noRange = case aspect asp of
-    Just Symbol -> []
-    Just asp ->
-      let
-        tok ival = do
-          guard (posLine (iEnd ival) == posLine (iStart ival))
-          Lsp.Position line col <- updatePosition delta (toLsp (iStart ival))
+aspectMapToTokens delta = mapMaybe go . RangeMap.toList where
+  go (range, aspect -> Just asp)
+    | isInteresting asp
+    , Just range <- toUpdatedPosition delta range
+    , (range ^. Lsp.start . Lsp.line) == (range ^. Lsp.end . Lsp.line)
+    = Just Lsp.SemanticTokenAbsolute
+        { _tokenType      = toLsp asp
+        , _line           = range ^. Lsp.start . Lsp.line
+        , _startChar      = range ^. Lsp.start . Lsp.character
+        , _length         = range ^. Lsp.end . Lsp.character - range ^. Lsp.start . Lsp.character
+        , _tokenModifiers = []
+        }
+  go _ = Nothing
 
-          pure Lsp.SemanticTokenAbsolute
-            { _tokenType      = toLsp asp
-            , _line           = line
-            , _startChar      = col
-            , _length         = fromIntegral (posPos (iEnd ival) - posPos (iStart ival))
-            , _tokenModifiers = []
-            }
-      in mapMaybe tok (rangeIntervals range)
-    _ -> []
-  go _ = []
-
-rangeContains :: PosDelta -> Lsp.Position -> Range' a -> Bool
-rangeContains delta pos rng = any go (rangeIntervals rng) where
-  go ival = or
-    [
-      -- isJust do
-      --   pos <- downgradePosition delta pos
-      --   guard (toLsp (iStart ival) <= pos && pos <= toLsp (iEnd ival))
-    isJust do
-        start <- updatePosition delta (toLsp (iStart ival))
-        end <- updatePosition delta (toLsp (iEnd ival))
-        guard (start <= pos && pos < end)
-    ]
+  isInteresting :: Aspect -> Bool
+  isInteresting Comment       = False
+  isInteresting Keyword       = False
+  isInteresting String        = False
+  isInteresting Number        = False
+  isInteresting Hole          = True
+  isInteresting Symbol        = False
+  isInteresting PrimitiveType = True
+  isInteresting Name{}        = True
+  isInteresting Pragma        = False
+  isInteresting Background    = False
+  isInteresting Markup        = False
