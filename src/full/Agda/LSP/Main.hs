@@ -4,6 +4,7 @@
 {-# LANGUAGE NondecreasingIndentation #-}
 module Agda.LSP.Main (runAgdaLSP) where
 
+import Control.Monad.Identity (runIdentity)
 import Control.Monad.Trans.Maybe
 import Control.Monad.IO.Class
 import Control.Monad.IO.Unlift
@@ -35,6 +36,7 @@ import Data.IORef
 import Data.Maybe
 import Data.List (find, sortOn, intercalate)
 import Data.Char (isSpace)
+import Data.Monoid
 
 import GHC.Generics
 
@@ -42,7 +44,7 @@ import Language.LSP.Protocol.Message
 import Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Lens
 import Language.LSP.Server
-import Language.LSP.VFS (virtualFileText, rangeLinesFromVfs, VirtualFile, file_text)
+import Language.LSP.VFS hiding (start, end, line, character)
 
 import System.Exit
 import System.IO
@@ -87,12 +89,14 @@ import Agda.Interaction.JSONTop () -- Instances only
 
 import qualified Agda.Utils.RangeMap as RangeMap
 import Agda.Utils.RangeMap (RangeMap)
+import qualified Agda.Utils.Null as Null
 import qualified Agda.Utils.BiMap as BiMap
 import Agda.Utils.Tuple (fst3)
 
 import Agda.Utils.Impossible
 import Agda.Utils.FileName
 import Agda.Utils.Either
+import Agda.Utils.Monad
 import Agda.Utils.Lens
 import Agda.Syntax.Parser (runPMIO)
 import Agda.Mimer.Mimer as Mimer
@@ -110,6 +114,8 @@ import Agda.Interaction.InteractionTop (highlightExpr)
 import Agda.Interaction.Highlighting.Range (rangeToRange)
 import Agda.Interaction.Options.Lenses
 import Agda.Interaction.Options
+
+import qualified Debug.Trace as DT
 
 syncOptions :: TextDocumentSyncOptions
 syncOptions = TextDocumentSyncOptions
@@ -180,8 +186,12 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
       Just worker -> pure (workers, Just worker)
 
       Nothing -> do
+        contents <- run . getVirtualFile $ toNormalizedUri  uri
+        let lines = maybe mempty (Rope.toTextLines . view file_text) contents
+
         lock   <- newMVar =<< newIORef initState
-        deltas <- newMVar def
+        deltas <- newMVar (PositionInfo (createPosDelta lines) def)
+        snapshot <- newMVar Nothing
         chan   <- newChan
 
         rec
@@ -219,6 +229,7 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
               , workerContext     = lspStateConfig state
               , workerOptions     = lspStateOptions state
               , workerPosInfo     = deltas
+              , workerSnapshot    = snapshot
               }
 
         run $ lspDebug $ "Spawned worker " <> show (workerThread worker) <> " to manage file " <> fp
@@ -231,10 +242,23 @@ runAtURI uri task = spawnOrGet uri >>= \case
   Just Worker{workerTasks = chan} -> liftIO $ writeChan chan (void task)
   Nothing -> lspDebug $ "URI is not a file: " <> show uri
 
+-- | Update the interaction ranges in the file.
+updateInteractionRanges :: Text.Text -> Task ()
+updateInteractionRanges text = do
+  path <- theSourceFile
+
+  (parseResult, _) <- liftIO . Pa.runPMIO $ Pa.parseFile Pa.tokensParser (RangeFile (srcFilePath path) Nothing) (Text.unpack text)
+  setInteractionPointRanges . mapMaybe findInteractionPoint $ either (const []) (fst . fst) parseResult
+
+  where
+    findInteractionPoint (TokSymbol SymQuestionMark ival) = Just (toLsp ival)
+    findInteractionPoint _ = Nothing
+
 onTextDocumentOpen :: Handlers WorkerM
 onTextDocumentOpen = notificationHandler SMethod_TextDocumentDidOpen \notif ->
   runAtURI (notif ^. params . textDocument . uri) do
   reportSLn "lsp.lifecycle" 10 "document opened"
+  updateInteractionRanges =<< maybe "" virtualFileText <$> theVirtualFile
   reloadURI
 
 onTextDocumentSaved :: Handlers WorkerM
@@ -246,20 +270,17 @@ onTextDocumentChange = notificationHandler SMethod_TextDocumentDidChange \notif 
   runAtURI (notif ^. params . textDocument . uri) do
   reportSLn "lsp.lifecycle" 10 $ "document changed\n" <> unlines (map show (notif ^. params . contentChanges))
 
-  modifyDelta \old -> do
-    let new = foldMap changeToDelta (notif ^. params . contentChanges)
-    -- Important: mappend for PosDelta is *applicative order*, so this
-    -- means "first apply the old diff, then apply the new diff".
-    new `seq` (new <> old)
+  snapshot <- takeSnapshot
+  text <- maybe "" virtualFileText <$> theVirtualFile
+  case snapshot of
+    Just snapshot
+      | snapshotText snapshot == text -> do
+        liftTCM . putTC $ snapshotTc snapshot
+        modifyDelta . const $ snapshotPosition snapshot
+      | otherwise -> reloadURI
+    _ -> modifyDelta $ flip posDeltaWithChangeEvents (notif ^. params . contentChanges)
 
-  path <- theSourceFile
-  text <- maybe "" virtualFileText <$> getVirtualFile (toNormalizedUri (notif ^. params . textDocument . uri))
-  (parseResult, _) <- liftIO . Pa.runPMIO $ Pa.parseFile Pa.tokensParser (RangeFile (srcFilePath path) Nothing) (Text.unpack text)
-  setInteractionPointRanges
-    . foldMap (\case
-        TokSymbol SymQuestionMark ival -> [toLsp ival]
-        _ -> mempty)
-    $ either (const []) (fst . fst) parseResult
+  updateInteractionRanges text
 
 onTextDocumentClosed :: Handlers WorkerM
 onTextDocumentClosed = notificationHandler SMethod_TextDocumentDidClose \notif ->
@@ -302,6 +323,8 @@ toDiagnostic x = do
 -- Reset the TC state inside a task.
 resetTCState :: Task ()
 resetTCState = do
+  _ <- takeSnapshot
+
   opts <- getInitialOptions
   root <- getRootPath
 
@@ -319,11 +342,13 @@ reloadURI :: Task ()
 reloadURI = do
   resetTCState
 
-  modifyDelta (const mempty)
+  fileContents <- maybe mempty (Rope.toTextLines . view file_text) <$> theVirtualFile
+  modifyDelta . const $ createPosDelta fileContents
+
   diagnoseTCM []
 
   sf <- theSourceFile
-  src <- liftTCM $ Imp.parseSource sf
+  src <- liftTCM $ Imp.parseSource' (const . pure . TL.fromStrict $ TextLines.toText fileContents) sf
   cr <- liftTCM $ Imp.typeCheckMain Imp.TypeCheck src
   void $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
   sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/infoview/refresh")) . toJSON =<< theURI
@@ -335,6 +360,8 @@ reloadURI = do
     diagnoseTCM (warn ++ err)
 
   reportSDoc "lsp.lifecycle" 10 $ "got warnings: " <+> prettyTCM (Imp.crWarnings cr)
+
+  whenM (Null.null <$> useTC stSyntaxInfo) . setTCLens stSyntaxInfo . iHighlighting $ Imp.crInterface cr
 
   -- ii <- useR stInteractionPoints
   -- let
@@ -375,7 +402,7 @@ provideSemanticTokens =
   let tokens = aspectMapToTokens delta info
   reportSLn "lsp.highlighting.semantic" 10 $ "returning " <> show (Prelude.length tokens) <> " semantic tokens"
   reportSLn "lsp.highlighting.semantic" 10 $ unlines
-    [ show r <> ": " <> show (aspect asp) | (_, asp) <- RangeMap.toList info, let r = updatePosition delta (toLsp (aspectRange asp))]
+    [ show (range, r) <> ": " <> show (aspect asp) | (range, asp) <- RangeMap.toList info, let r = toUpdatedPosition delta range]
 
   case encodeTokens agdaTokenLegend (relativizeTokens (sortOn (\x -> (x ^. line, x ^. startChar)) tokens)) of
     Left  e    -> res $ Right (InR Lsp.Null)
@@ -399,21 +426,18 @@ getFileSubstring file (Lsp.Range (Lsp.Position sL sC) (Lsp.Position eL eC)) =
   Rope.toText main
 
 -- | Get the contents of an interaction point, if still present in the document.
-interactionContents :: InteractionPointInfo -> VirtualFile -> Maybe (Agda.Range, Text.Text)
+interactionContents :: InteractionPointInfo -> VirtualFile -> Maybe (Agda.Range, Int, Text.Text)
 interactionContents (_, ip, lrange) file = do
   contents <- Text.stripPrefix "{!" <=< Text.stripSuffix "!}" $ getFileSubstring file lrange
 
-  let range = ipRange ip
-  Interval is ie <- rangeToInterval range
   let
+    range = toAgdaRange (file ^. file_text) (rangeFile (ipRange ip)) lrange
     (spaces, text) = Text.span isSpace contents
-    inner = case range of
-      NoRange         -> Strict.Nothing
-      Agda.Range sf _ -> sf
-    is' = movePosByString is ("{!" ++ Text.unpack spaces)
+    offset = 2 {- "{!" -} + Text.length spaces
 
-  is' `seq` pure
-    ( intervalToRange inner (Interval is' ie)
+  offset `seq` pure
+    ( modifyRangePositions (+ offset) (file ^. file_text) range
+    , offset
     , Text.strip text
     )
 
@@ -439,9 +463,11 @@ fillQuery Query_AllGoals = do
 fillQuery (Query_GoalInfo iid) = withInteractionId iid do
   mi <- lookupInteractionId iid
   ip <- lookupInteractionPoint iid
-  delta <- getDelta
+  posInfo <- getPositionInfo
 
   let
+    delta = posInfoDelta posInfo
+
     mkVar :: ContextEntry -> Task (Maybe Local)
     mkVar Dom{ domInfo = ai, unDom = (name, t) } = do
       -- if shouldHide ai name then return Nothing else Just <$> do
@@ -455,7 +481,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
       pure $ Just Local
         { localBinder      = printed (Binder (ReifiedName n x) con False)
         , localValue       = Nothing
-        , localBindingSite = updatePosition delta (toLsp (nameBindingSite name))
+        , localBindingSite = toUpdatedPosition delta (nameBindingSite name)
         , localInScope     = s == C.InScope
         , localHiding      = getHiding ai
         , localModality    = getModality ai
@@ -474,7 +500,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
 
       pure $ Just Local
         { localBinder      = printed (Binder (ReifiedName n x) ty False)
-        , localBindingSite = updatePosition delta (toLsp (nameBindingSite name))
+        , localBindingSite = toUpdatedPosition delta (nameBindingSite name)
         , localValue       = Just (printed (Binder (ReifiedName n x) v True))
         , localInScope     = s == C.InScope
         , localHiding      = getHiding (domInfo dom)
@@ -494,7 +520,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
   boundary <- liftTCM $ B.getIPBoundary AsIs iid
 
   pure GoalInfo
-    { goalGoal     = Goal iid (toLsp (ipRange ip)) gty -- TODO: Remap position.
+    { goalGoal     = Goal iid (fromMaybe (toLsp (ipRange ip)) (getCurrentInteractionRange posInfo ip)) gty
     , goalContext  = lets ++ locals
     , goalBoundary = case boundary of
         [] -> Nothing
@@ -634,7 +660,7 @@ goToDefinition caps = requestHandlerTCM SMethod_TextDocumentDefinition (view (pa
   tc <- getTCState
 
   let currentAspect = findAspect delta (req ^. params . position) info
-  res case currentAspect >>= definitionSite of
+  res case currentAspect >>= definitionSite . snd of
     Just (DefinitionSite mod pos _ _)
       | Just path <- tc ^. stModuleToSource . key mod
       , Just info <- tc ^. stVisitedModules . key mod
@@ -650,7 +676,7 @@ goToDefinition caps = requestHandlerTCM SMethod_TextDocumentDefinition (view (pa
           then
             let
               link = Lsp.LocationLink
-                { _originSelectionRange = toLsp . aspectRange <$> currentAspect
+                { _originSelectionRange = fst <$> currentAspect
                 , _targetUri = srcUri
                 , _targetRange = srcPos
                 , _targetSelectionRange = srcPos
@@ -663,13 +689,17 @@ goToDefinition caps = requestHandlerTCM SMethod_TextDocumentDefinition (view (pa
     notFound = Right . InR . InR $ Lsp.Null
 
 -- | Find an aspect at the specified position.
-findAspect :: PosDelta -> Lsp.Position -> RangeMap Aspects -> Maybe Aspects
-findAspect delta position =
-  -- TODO: This is currently a linear search. Ideally we'd be able to map
-  -- positions to byte offsets directly, which'd make this much more efficient.
-  -- Alternatively we could do a binary search over the aspect map, we just need
-  -- to ensure that all elements have a range.
-  find (rangeContains delta position . aspectRange) . map snd . RangeMap.toList
+findAspect :: PosDelta -> Lsp.Position -> RangeMap Aspects -> Maybe (Lsp.Range, Aspects)
+findAspect delta pos =
+  -- TODO: This is currently a linear search. Ideally we'd be able to do a
+  -- binary search over the aspect map.
+  getFirst . foldMap (First . contains) . RangeMap.toList
+
+  where
+    contains (range, aspect) = do
+      r <- toUpdatedPosition delta range
+      guard (positionInRange pos r)
+      pure (r, aspect)
 
 highlightReferences :: Handlers WorkerM
 highlightReferences = requestHandlerTCM SMethod_TextDocumentDocumentHighlight (view (params . textDocument . uri)) \req res -> do
@@ -679,15 +709,16 @@ highlightReferences = requestHandlerTCM SMethod_TextDocumentDocumentHighlight (v
   delta <- getDelta
 
   let currentAspect = findAspect delta (req ^. params . position) info
-  res case currentAspect >>= definitionSite of
+  res case currentAspect >>= definitionSite . snd of
     Nothing -> Right . InR $ Lsp.Null
     Just s@(DefinitionSite mod pos _ _) -> Right . InL
-      . nubOrd
-      . concatMap (mapMaybe (fmap makeHighlight . updatePosition delta . toLsp) . rangeIntervals . aspectRange . snd)
-      . filter (\(_, x) -> elem s (definitionSite x))
+      . mapMaybe (fmap makeHighlight . toUpdatedPosition delta . fst)
+      . filter (\(_, x) -> s `elem` definitionSite x)
       $ RangeMap.toList info
 
-  where makeHighlight r = DocumentHighlight r (Just DocumentHighlightKind_Read)
+  where
+    makeHighlight r = DocumentHighlight r (Just DocumentHighlightKind_Read)
+
 
 getCodeActions :: Handlers WorkerM
 getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params . textDocument . uri)) \req res -> do
@@ -695,13 +726,13 @@ getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params 
   reportSLn "lsp.codeAction" 10 $ show req
 
   ii <- getActiveInteractionPoints
-  virtualFile <- getVirtualFile $ toNormalizedUri fileUri
+  virtualFile <- theVirtualFile
 
   let
     reqRange@(Lsp.Range reqStart reqEnd) = req ^. params . range
 
     resolveInteraction i@(_, ip, range) = do
-      (_, contents) <- interactionContents i =<< virtualFile
+      (_, _, contents) <- interactionContents i =<< virtualFile
       pure (range, not (Text.null contents))
 
     -- Determine if this interaction point overlaps with the provided range
@@ -746,12 +777,12 @@ commandHandlerInteractionPoint
   :: Uri
   -> Lsp.Position
   -> (Either ResponseError (Value |? Null) -> WorkerM ())
-  -> (InteractionPointInfo -> (Agda.Range, Text.Text)
+  -> (InteractionPointInfo -> (Agda.Range, Int, Text.Text)
     -> Task (Either ResponseError (Value |? Null)))
   -> WorkerM ()
 commandHandlerInteractionPoint uri pos res cont = commandHandlerTCM uri res \run -> do
   pos <- findInteractionPoint pos
-  virtualFile <- liftIO . run . getVirtualFile $ toNormalizedUri uri
+  virtualFile <- theVirtualFile
 
   case pos of
     Just i
@@ -768,7 +799,7 @@ executeAgdaCommand :: Handlers WorkerM
 executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
   case parseCommand (req ^. params . command) (fromMaybe [] (req ^. params . arguments)) of
     Nothing -> res (Left (ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot parse command" Nothing))
-    Just (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, contents) -> do
+    Just (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, _, contents) -> do
       -- TODO: What's the proper range here? This gets passed from the elisp side, so
       -- I think it's the *inside* of the interaction point, after edits have been applied.
       result <- Mimer.mimer ii inner (Text.unpack contents)
@@ -782,30 +813,48 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
 
       pure (Right (InR Lsp.Null))
 
-    Just (Command_Give uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, contents) -> do
+    Just (Command_Give uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, offset, contents) -> do
       scope <- getInteractionScope ii
 
-      (given, res) <- liftTCM do
-        removeHighlightingFor (ipRange ip)
+      posInfo <- getPositionInfo
+      fileContents <- view file_text . fromJust <$> theVirtualFile
 
+      ((edit, fileContents'), state) <- snapshotTCM $ removeHighlightingFor (ipRange ip) >> rewritePositions posInfo fileContents do
         -- TODO: Run lexer on the contents and replace ? for {! !}
         -- before parsing, so the ranges are correct
         given <- B.parseExprIn ii inner (Text.unpack contents)
         res <- B.give WithoutForce ii Nothing given
+        ce <- abstractToConcreteScope scope res
+
+        let
+          (replacement, offset') =
+            if given == res
+            then case ce of
+              C.Paren{} -> ("(" <> contents <> ")", offset - 1)
+              _ -> (contents, offset)
+            else (Text.pack (prettyShow ce), offset)
 
         highlightExpr res
+        pure (TextEdit range replacement, offset')
 
-        pure (given, res)
+      applyEdit "Give" (Map.singleton uri [edit])
 
-      ce <- abstractToConcreteScope scope res
-
-      let text = if given == res then contents else Text.pack (prettyShow ce)
-      applyEdit "Give" (Map.singleton uri [TextEdit range text])
+      let fileLines = Rope.toTextLines fileContents'
+      setSnapshot . Just $ StateSnapshot
+        { snapshotText = TextLines.toText fileLines
+        , snapshotTc = state
+        , snapshotPosition = createPosDelta fileLines
+       }
 
       pure (Right (InR Lsp.Null))
 
   where
     showMessage kind msg = void $ sendNotification SMethod_WindowShowMessage $ ShowMessageParams kind msg
+
+    applyEditNow range replacement contents
+      = runIdentity . applyChange mempty contents
+      . TextDocumentContentChangeEvent . InL
+      $ TextDocumentContentChangePartial range Nothing replacement
 
     applyEdit title changes =
       let
@@ -816,6 +865,52 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
           }
       in void $ sendRequest SMethod_WorkspaceApplyEdit edit (\_ ->
         void $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ())))
+
+    snapshotTCM :: TCM a -> Task (a, TCState)
+    snapshotTCM task = do
+      state <- liftTCM getTCState
+      liftIO $ runTCM initEnv state task
+
+    -- Apply some action that modifies the file, rewriting interaction points and
+    -- highlighting information to match the new range.
+    --
+    -- The inner action should return an edit to apply, and an offset that is used to
+    -- adjust the position of any changes that between the range of the entered
+    -- expression, and its effective position in the file (for instance, due to the leading {!).
+    rewritePositions :: PositionInfo -> Rope.Rope -> TCM (TextEdit, Int) -> TCM (TextEdit, Rope.Rope)
+    rewritePositions posInfo fileContents makeEdit = do
+      -- Capture the old highlighting and interaction points
+      oldSyntaxInfo <- useTC stSyntaxInfo
+      oldInteractionPoints <- useTC stInteractionPoints
+
+      -- Clear the highlighting
+      setTCLens stSyntaxInfo mempty
+      -- Apply our edit, this will fill any new highlighting information
+      (edit@(TextEdit range replacement), offset) <- makeEdit
+
+      let
+        newContents = applyEditNow range replacement fileContents
+        newDelta = posDeltaWithChange (posInfoDelta posInfo) range replacement
+        newSyntaxInfo = updateRangeMap newDelta newContents oldSyntaxInfo
+
+        updatePoint (ii, ip)
+          -- If we're a new interaction point, move it by two.
+          | not (BiMap.source ii oldInteractionPoints)
+          = (ii, ip { ipRange = modifyRangePositions (\x -> x - offset) newContents (ipRange ip) })
+          -- If we're an existing point, attempt to remap the position
+          | Just pos <- getCurrentInteractionRange posInfo { posInfoDelta = newDelta } ip
+          = (ii, ip { ipRange = toAgdaRange newContents (rangeFile (ipRange ip)) pos })
+          -- Otherwise ignore.
+          | otherwise = (ii, ip)
+
+      -- Offset any new highlighting information, and then add back the (now remapped)
+      -- information.
+      modifyTCLens stSyntaxInfo ((newSyntaxInfo <>) . modifyRangeMapPositions (\x -> x - offset))
+
+      -- Offset all interaction points.
+      modifyTCLens stInteractionPoints (BiMap.fromList . map updatePoint . BiMap.toList)
+
+      pure (edit, newContents)
 
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers caps = mconcat

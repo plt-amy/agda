@@ -1,73 +1,83 @@
 module Agda.LSP.Position
   ( PosDelta
-  , changeToDelta
+  , createPosDelta
+  , posDeltaWithChange
+  , posDeltaWithChangeEvents
+
   , Positionable(..)
+
+  , modifyRangeMapPositions
+  , updateRangeMap
+
+  , toAgdaRange
+  , toAgdaPos
+  , modifyRangePositions
   ) where
 
 import Control.Monad
 
-import qualified Data.Text as T
+import qualified Data.Text.Utf16.Rope.Mixed as Rope
+import qualified Data.Text.Lines as TextLines
+import qualified Data.Map.Strict as Map
+import qualified Data.Text as Text
+import Data.Text.Lines (TextLines)
+import Data.Strict.Tuple (Pair(..))
+import Data.Maybe
 
 import Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Lens
 
+import qualified Agda.Interaction.Highlighting.Range as Range
+import qualified Agda.Syntax.Position as Position
+import qualified Agda.Utils.RangeMap as RangeMap
+import Agda.Syntax.Common.Aspect
+
 import Agda.Utils.Lens
 
-data Result a
-  = RangeR a a
-  | ExactR a
-  deriving (Eq, Show, Ord, Functor)
 
-prLower :: Result a -> a
-prLower (RangeR x _) = x
-prLower (ExactR x) = x
-
-prUpper :: Result a -> a
-prUpper (RangeR x _) = x
-prUpper (ExactR x) = x
-
-instance Applicative Result where
-  pure = ExactR
-
-  ExactR f <*> a = fmap f a
-  RangeR f g <*> ExactR x = RangeR (f x) (g x)
-  RangeR f g <*> RangeR x y = RangeR (f x) (g y)
-
-instance Monad Result where
-  ExactR x >>= f = f x
-  RangeR x y >>= f = RangeR (prLower (f x)) (prUpper (f y))
-
+-- | Maps positions in an original document to a newer version.
 data PosDelta = PosDelta
-  { toDelta   :: !(Position -> Result Position)
-  , fromDelta :: !(Position -> Result Position)
+  { delta :: !(Position -> Maybe Position)
+  , lines :: TextLines
   }
 
-instance Semigroup PosDelta where
-  PosDelta f1 g1 <> PosDelta f2 g2 = PosDelta (f1 <=< f2) (g2 >=> g1)
+-- | Create a new 'PosDelta' from the contents of a file.
+createPosDelta :: TextLines -> PosDelta
+createPosDelta = PosDelta pure
 
-instance Monoid PosDelta where
-  mempty = PosDelta pure pure
+-- | Create a new delta that updates positions after applying some edit.
+posDeltaWithChange :: PosDelta -> Range -> Text.Text -> PosDelta
+posDeltaWithChange (PosDelta delta txt) range text = PosDelta (delta >=> toCurrent range text) txt
 
-toCurrent :: Range -> T.Text -> Position -> Result Position
+-- | Create a new delta that updates positions after applying an edit event.
+posDeltaWithChangeEvent :: PosDelta -> TextDocumentContentChangeEvent -> PosDelta
+posDeltaWithChangeEvent delta (TextDocumentContentChangeEvent (InL x)) = posDeltaWithChange delta (x ^. range) (x ^. text)
+posDeltaWithChangeEvent (PosDelta _ txt) (TextDocumentContentChangeEvent (InR _)) = PosDelta (const Nothing) txt
+
+-- | Create a new delta that updates positions after applying a batch of edit events.
+posDeltaWithChangeEvents :: PosDelta -> [TextDocumentContentChangeEvent] -> PosDelta
+posDeltaWithChangeEvents delta changes = foldl posDeltaWithChangeEvent delta changes
+
+toCurrent :: Range -> Text.Text -> Position -> Maybe Position
 toCurrent (Range start@(Position startLine startColumn) end@(Position endLine endColumn)) t (Position line column)
   | line < startLine || line == startLine && column < startColumn =
     -- Position is before the change and thereby unchanged.
-    ExactR $ Position line column
+    Just $ Position line column
   | line > endLine || line == endLine && column >= endColumn =
     -- Position is after the change so increase line and column number
     -- as necessary.
-    ExactR $ newLine `seq` newColumn `seq` Position newLine newColumn
-  | otherwise = RangeR start end
+    Just $ newLine `seq` newColumn `seq` Position newLine newColumn
+  | otherwise = Nothing
   -- Position is in the region that was changed.
   where
     lineDiff = linesNew - linesOld
-    linesNew = T.count "\n" t
+    linesNew = Text.count "\n" t
     linesOld = fromIntegral endLine - fromIntegral startLine
 
     newEndColumn :: UInt
     newEndColumn
-      | linesNew == 0 = fromIntegral $ fromIntegral startColumn + T.length t
-      | otherwise = fromIntegral $ T.length $ T.takeWhileEnd (/= '\n') t
+      | linesNew == 0 = fromIntegral $ fromIntegral startColumn + Text.length t
+      | otherwise = fromIntegral $ Text.length $ Text.takeWhileEnd (/= '\n') t
 
     newColumn :: UInt
     newColumn
@@ -77,67 +87,82 @@ toCurrent (Range start@(Position startLine startColumn) end@(Position endLine en
     newLine :: UInt
     newLine = fromIntegral $ fromIntegral line + lineDiff
 
-fromCurrent :: Range -> T.Text -> Position -> Result Position
-fromCurrent (Range start@(Position startLine startColumn) end@(Position endLine endColumn)) t (Position line column)
-  | line < startLine || line == startLine && column < startColumn =
-    -- Position is before the change and thereby unchanged
-    ExactR $ Position line column
-  | line > newEndLine || line == newEndLine && column >= newEndColumn =
-    -- Position is after the change so increase line and column number
-    -- as necessary.
-    ExactR $ newLine `seq` newColumn `seq` Position newLine newColumn
-  | otherwise = RangeR start end
-  -- Position is in the region that was changed.
-  where
-    lineDiff = linesNew - linesOld
-    linesNew = T.count "\n" t
-    linesOld = fromIntegral endLine - fromIntegral startLine
+-- | Convert a character offset to a position in the new document.
+getNewPosition :: PosDelta -> Int -> Maybe Lsp.Position
+getNewPosition d@(PosDelta delta lines) offset =
+  let
+    (before, _) = TextLines.splitAt (fromIntegral offset - 1) lines
+    pos = TextLines.lengthAsPosition before
+  in delta $ Lsp.Position (fromIntegral (TextLines.posLine pos)) (fromIntegral (TextLines.posColumn pos))
 
-    newEndLine :: UInt
-    newEndLine = fromIntegral $ fromIntegral endLine + lineDiff
-
-    newEndColumn :: UInt
-    newEndColumn
-      | linesNew == 0 = fromIntegral $ fromIntegral startColumn + T.length t
-      | otherwise = fromIntegral $ T.length $ T.takeWhileEnd (/= '\n') t
-
-    newColumn :: UInt
-    newColumn
-      | line == newEndLine = (column + endColumn) - newEndColumn
-      | otherwise = column
-
-    newLine :: UInt
-    newLine = fromIntegral $ fromIntegral line - lineDiff
-
-changeToDelta :: TextDocumentContentChangeEvent -> PosDelta
-changeToDelta (TextDocumentContentChangeEvent (InL x)) =
-  PosDelta (toCurrent (x ^. range) (x ^. text)) (fromCurrent (x ^. range) (x ^. text))
-changeToDelta _ = mempty
-
-
-class Positionable a where
-  updatePosition :: PosDelta -> a -> Maybe a
-  downgradePosition :: PosDelta -> a -> Maybe a
-
-
-instance Positionable Position where
-  updatePosition delta pos = case toDelta delta pos of
-    ExactR r -> Just r
-    _ -> Nothing
-
-  downgradePosition delta pos = case fromDelta delta pos of
-    ExactR r -> Just r
-    _ -> Nothing
-
--- | Transform a range and ensure its invariants still hold.
-mapRange :: (PosDelta -> Position -> Maybe Position) -> PosDelta -> Range -> Maybe Range
-mapRange f delta (Range s e) = do
-  s' <- f delta s
-  e' <- f delta e
+getNewRange :: PosDelta -> Int -> Int -> Maybe Lsp.Range
+getNewRange delta s e = do
+  s' <- getNewPosition delta s
+  -- Ranges are exclusive. So walk back one character, and then step it forward again.
+  e' <- over character (+ 1) <$> getNewPosition delta (e - 1)
   guard (s' <= e')
   pure (Range s' e')
 
+class Positionable a where
+  -- | The result of updating a position, typically an LSP type.
+  type PositionableResult a
 
-instance Positionable Range where
-  updatePosition = mapRange updatePosition
-  downgradePosition = mapRange downgradePosition
+  -- | Update this position according to the given position delta.
+  toUpdatedPosition :: PosDelta -> a -> Maybe (PositionableResult a)
+
+instance Positionable (Position.Position' a) where
+  type PositionableResult (Position.Position' a) = Lsp.Position
+  toUpdatedPosition delta pos = getNewPosition delta (fromIntegral (Position.posPos pos))
+
+instance Positionable (Position.Interval' a) where
+  type PositionableResult (Position.Interval' a) = Lsp.Range
+  toUpdatedPosition delta (Position.Interval s e) = getNewRange delta (fromIntegral (Position.posPos s)) (fromIntegral (Position.posPos e))
+
+instance Positionable (Position.Range' a) where
+  type PositionableResult (Position.Range' a) = Lsp.Range
+  toUpdatedPosition delta range = toUpdatedPosition delta =<< Position.rangeToInterval range
+
+instance Positionable Range.Range where
+  type PositionableResult Range.Range = Lsp.Range
+  toUpdatedPosition delta (Range.Range s e) = getNewRange delta s e
+
+
+modifyRangeMapPositions :: (Int -> Int) -> RangeMap.RangeMap a -> RangeMap.RangeMap a
+modifyRangeMapPositions f = RangeMap.RangeMap . Map.fromAscList . map updatePos . Map.toList . RangeMap.rangeMap where
+  updatePos (s, RangeMap.PairInt (e :!: a)) = (f s, RangeMap.PairInt (f e :!: a))
+
+modifyRangePositions :: (Int -> Int) -> Rope.Rope -> Position.Range' a -> Position.Range' a
+modifyRangePositions f _ Position.NoRange = Position.NoRange
+modifyRangePositions f lines (Position.Range s is) = Position.Range s (fmap goI is) where
+  goI (Position.Interval s e) = Position.Interval (goP s) (goP e)
+  goP (Position.Pn s o l c) =
+    let
+      o' = fromIntegral . f $ fromIntegral o
+      (before, _) = Rope.charSplitAt (fromIntegral o' - 1) lines
+      pos = Rope.charLengthAsPosition before
+    in Position.Pn s o' (fromIntegral (TextLines.posLine pos) + 1) (fromIntegral (TextLines.posColumn pos) + 1)
+
+updateRangeMap :: PosDelta -> Rope.Rope -> RangeMap.RangeMap Aspects -> RangeMap.RangeMap Aspects
+updateRangeMap delta newLines = RangeMap.RangeMap . Map.fromList . mapMaybe updatePos . RangeMap.toList where
+  updatePos (r, aspect) = do
+    Lsp.Range s e <- toUpdatedPosition delta r
+    pure (getCharOffset newLines s, RangeMap.PairInt (getCharOffset newLines e :!: aspect))
+
+-- | Convert an LSP range to an Agda range.
+toAgdaRange :: Rope.Rope -> a -> Lsp.Range -> Position.Range' a
+toAgdaRange lines file (Lsp.Range start end) = Position.Range file . pure $
+  Position.Interval (toAgdaPos lines () start) (toAgdaPos lines () end)
+
+-- | Convert an LSP range to an Agda position.
+toAgdaPos :: Rope.Rope -> a -> Lsp.Position -> Position.Position' a
+toAgdaPos lines file pos = Position.Pn
+  file
+  (fromIntegral (getCharOffset lines pos))
+  (fromIntegral (pos ^. line) + 1)
+  (fromIntegral (pos ^. character) + 1)
+
+-- | Get the offset of a character from an LSP position.
+getCharOffset :: Rope.Rope -> Lsp.Position -> Int
+getCharOffset lines pos =
+  let (before, _) = Rope.splitAtLine (fromIntegral (pos ^. line)) lines
+  in fromIntegral (Rope.charLength before) + fromIntegral (pos ^. character) + 1
