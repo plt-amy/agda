@@ -13,6 +13,7 @@ import Control.Monad.Except (MonadError(catchError))
 import Control.Applicative
 import Control.Concurrent
 import Control.Exception
+import Control.Monad
 
 import qualified Data.Text.Utf16.Rope.Mixed as Rope
 import qualified Data.HashMap.Strict as HashMap
@@ -28,6 +29,7 @@ import Data.HashMap.Strict (HashMap)
 import Data.List.NonEmpty (NonEmpty(..))
 import Data.Strict.Tuple (Pair(..))
 import Data.Aeson.Types as Aeson
+import Data.Traversable
 import Data.Foldable
 import Data.Default
 import Data.Coerce
@@ -61,6 +63,7 @@ import Agda.Syntax.Translation.AbstractToConcrete
 import Agda.Syntax.Abstract.Pretty
 import Agda.Syntax.Concrete.Pretty () -- Instances only
 import Agda.Syntax.Common.Pretty (prettyShow)
+import Agda.Syntax.Common (isInstance)
 import Agda.Syntax.Scope.Base
 import Agda.Syntax.Concrete (Module(modDecls))
 import Agda.Syntax.Position
@@ -77,6 +80,7 @@ import qualified Agda.Syntax.Parser as Pa
 import qualified Agda.Syntax.Parser.Tokens as T
 
 import Agda.LSP.Translation
+import Agda.LSP.Diagnostic
 import Agda.LSP.Position
 import Agda.LSP.Utils
 import Agda.LSP.Goal
@@ -111,12 +115,14 @@ import Agda.Syntax.Parser (runPMIO)
 import Agda.Mimer.Mimer as Mimer
 import qualified Agda.Syntax.Parser as P
 import qualified Agda.Utils.Maybe.Strict as Strict
-import Agda.Syntax.Common (InteractionId, LensModality (getModality), LensHiding (getHiding))
+import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
+import Agda.Syntax.Common (InteractionId, LensModality (getModality), LensHiding (getHiding), Relevance (Relevant), LensRelevance (getRelevance), inverseComposeRelevance, LensQuantity (getQuantity), moreQuantity)
 import Agda.Syntax.Fixity (Precedence(TopCtx))
 
 import Agda.LSP.Monad.Base
 import Agda.LSP.Commands
 import Agda.LSP.Output
+import qualified Agda.LSP.Goal as Goal
 
 syncOptions :: TextDocumentSyncOptions
 syncOptions = TextDocumentSyncOptions
@@ -154,7 +160,12 @@ runAgdaLSP setup = do
 
 lspOutputCallback :: Uri -> LanguageContextEnv LspConfig -> InteractionOutputCallback
 lspOutputCallback uri config = liftIO . runLspT config . \case
-  Resp_RunningInfo _ s -> lspDebug s
+  Resp_RunningInfo v s -> do
+    lspDebug s
+    when (v <= 1) $ sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/infoview/message")) $ Object $ KeyMap.fromList
+      [ ("message", toJSON s)
+      , ("uri", toJSON uri)
+      ]
   _ -> pure ()
 
 lspInit
@@ -190,10 +201,10 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
         contents <- run . getVirtualFile $ toNormalizedUri  uri
         let lines = maybe mempty (Rope.toTextLines . view file_text) contents
 
-        lock   <- newMVar =<< newIORef initState
-        deltas <- newMVar (PositionInfo (createPosDelta lines) def)
+        lock     <- newMVar =<< newIORef initState
+        deltas   <- newMVar (PositionInfo (createPosDelta lines) def)
         snapshot <- newMVar Nothing
-        chan   <- newChan
+        chan     <- newChan
 
         rec
           wthread <- forkIO . forever $ do
@@ -202,7 +213,7 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
             let
               report :: TCErr -> TCM ()
               report terr = do
-                diag <- errorToDiagnostic terr
+                diag <- runReaderT (unTask (toDiagnostic terr)) worker
                 liftIO . run $
                   sendNotification SMethod_TextDocumentPublishDiagnostics $ PublishDiagnosticsParams
                     { _uri         = uri
@@ -264,7 +275,7 @@ onTextDocumentOpen = notificationHandler SMethod_TextDocumentDidOpen \notif ->
 
 onTextDocumentSaved :: Handlers WorkerM
 onTextDocumentSaved = notificationHandler SMethod_TextDocumentDidSave \notif ->
-  runAtURI (notif ^. params . textDocument . uri) do reloadURI
+  runAtURI (notif ^. params . textDocument . uri) reloadURI
 
 onTextDocumentChange :: Handlers WorkerM
 onTextDocumentChange = notificationHandler SMethod_TextDocumentDidChange \notif ->
@@ -305,22 +316,6 @@ diagnoseTCM diag = do
     , _diagnostics = diag
     }
 
-toDiagnostic :: forall a. (PrettyTCM a, Agda.HasRange a) => a -> TCM Lsp.Diagnostic
-toDiagnostic x = do
-  msg <- Ppr.render <$> prettyTCM x
-  pure $ Lsp.Diagnostic
-    { _range              = toLsp (Agda.getRange x)
-    , _severity           = Just Lsp.DiagnosticSeverity_Error
-    , _code               = Nothing
-    , _codeDescription    = Nothing
-    , _source             = Just "agda"
-    , _message            = Text.pack (msg <> "\n" <> show (toLsp (Agda.getRange x)))
-    , _tags               = Nothing
-    , _relatedInformation = Nothing
-    , _data_              = Nothing
-    }
-
-
 -- Reset the TC state inside a task.
 resetTCState :: Task ()
 resetTCState = do
@@ -339,6 +334,25 @@ resetTCState = do
         absPath <- liftIO $ absolute path
         I.setCommandLineOptions' absPath opts
 
+refreshClientInfo :: Task ()
+refreshClientInfo = detachTask do
+  void $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
+  sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/infoview/refresh")) . toJSON =<< theURI
+
+  WarningsAndNonFatalErrors warn err <- liftTCM $ getWarningsAndNonFatalErrors
+
+  when (not (null warn) || not (null err)) do
+    warn <- foldMap toDiagnostic warn
+    err <- foldMap toDiagnostic err
+    diagnoseTCM (warn ++ err)
+
+  goals <- fillQuery (Query_AllGoals False)
+  uri <- theURI
+  sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/goals")) $ Object $ KeyMap.fromList
+    [ ("goals", toJSON goals)
+    , ("uri",   toJSON uri)
+    ]
+
 reloadURI :: Task ()
 reloadURI = do
   resetTCState
@@ -351,35 +365,11 @@ reloadURI = do
   sf <- theSourceFile
   src <- liftTCM $ Imp.parseSource' (const . pure . TL.fromStrict $ TextLines.toText fileContents) sf
   cr <- liftTCM $ Imp.typeCheckMain Imp.TypeCheck src
-  void $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
-  sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/infoview/refresh")) . toJSON =<< theURI
-
-  unless (null (Imp.crWarnings cr)) do
-    WarningsAndNonFatalErrors warn err <- liftTCM $ getWarningsAndNonFatalErrors
-    warn <- traverse (liftTCM . toDiagnostic) warn
-    err <- traverse (liftTCM . toDiagnostic) err
-    diagnoseTCM (warn ++ err)
 
   reportSDoc "lsp.lifecycle" 10 $ "got warnings: " <+> prettyTCM (Imp.crWarnings cr)
-
   whenM (Null.null <$> useTC stSyntaxInfo) . setTCLens stSyntaxInfo . iHighlighting $ Imp.crInterface cr
 
-  -- ii <- useR stInteractionPoints
-  -- let
-  --   edits = BiMap.elems ii >>= \ip -> do
-  --     guard (isQuestion ip)
-  --     pure $! TextEdit (toLsp (ipRange ip)) "{! !}"
-
-  --   edit = ApplyWorkspaceEditParams
-  --     { _label = Just "Question marks"
-  --     , _edit = WorkspaceEdit
-  --       { _documentChanges   = Nothing
-  --       , _changeAnnotations = Nothing
-  --       , _changes           = Just (Map.singleton (fromNormalizedUri (workerUri ?worker)) edits)
-  --       }
-  --     }
-
-  -- requestTCM SMethod_WorkspaceApplyEdit edit (const (pure ()))
+  refreshClientInfo
 
 isQuestion :: InteractionPoint -> Bool
 isQuestion InteractionPoint{ipRange = r}
@@ -396,13 +386,13 @@ requestHandlerTCM method uri cont = requestHandler method \req res -> withRunInI
 
 provideSemanticTokens :: Handlers WorkerM
 provideSemanticTokens =
-  requestHandlerTCM SMethod_TextDocumentSemanticTokensFull (view (params . textDocument . uri)) \req res -> do
+  requestHandlerTCM SMethod_TextDocumentSemanticTokensFull (view (params . textDocument . uri)) \req res -> detachTask do
   info <- useTC stSyntaxInfo
 
   delta <- getDelta
   let tokens = aspectMapToTokens delta info
   reportSLn "lsp.highlighting.semantic" 10 $ "returning " <> show (Prelude.length tokens) <> " semantic tokens"
-  reportSLn "lsp.highlighting.semantic" 10 $ unlines
+  reportSLn "lsp.highlighting.semantic" 666 $ unlines
     [ show (range, r) <> ": " <> show (aspect asp) | (range, asp) <- RangeMap.toList info, let r = toUpdatedPosition delta range]
 
   case encodeTokens agdaTokenLegend (relativizeTokens (sortOn (\x -> (x ^. line, x ^. startChar)) tokens)) of
@@ -449,25 +439,41 @@ printedTerm rewr ty = do
 
 fillQuery :: Query a -> Task a
 fillQuery (Query_GoalAt pos) = fmap fst3 <$> findInteractionPoint pos
+fillQuery Query_ModuleName = fmap (printed . snd) <$> useTC stCurrentModule
 
-fillQuery Query_AllGoals = do
+fillQuery (Query_AllGoals t) = do
   iis <- getActiveInteractionPoints
-  forM iis \(id, ip, range) -> withInteractionId id do
+  for iis \(id, ip, range) -> withInteractionId id do
     mi <- lookupInteractionId id
-    ty <- fmap printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
+    ty <- if t
+      then fmap (pure . printed) . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
+      else pure Nothing
     pure Goal
-      { goalId       = id
-      , goalType     = ty
-      , goalRange    = range
+      { goalId    = id
+      , goalType  = ty
+      , goalRange = range
       }
 
 fillQuery (Query_GoalInfo iid) = withInteractionId iid do
   mi <- lookupInteractionId iid
   ip <- lookupInteractionPoint iid
   posInfo <- getPositionInfo
+  mod <- currentModality
 
   let
     delta = posInfoDelta posInfo
+
+    flags s ai =
+      let
+        them = mconcat
+          [ [ Goal.NotInScope | s /= C.InScope ]
+          , [ Goal.Inaccessible r
+            | let r = getRelevance mod `inverseComposeRelevance` getRelevance ai
+            , r /= Relevant ]
+          , [ Goal.Erased   | not (getQuantity ai `moreQuantity` getQuantity mod) ]
+          , [ Goal.Instance | isInstance ai ]
+          ]
+      in case them of { [] -> Nothing; xs -> Just xs }
 
     mkVar :: ContextEntry -> Task (Maybe Local)
     mkVar Dom{ domInfo = ai, unDom = (name, t) } = do
@@ -483,7 +489,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
         { localBinder      = printed (Binder (ReifiedName n x) con False)
         , localValue       = Nothing
         , localBindingSite = toUpdatedPosition delta (nameBindingSite name)
-        , localInScope     = s == C.InScope
+        , localFlags       = flags s ai
         , localHiding      = getHiding ai
         , localModality    = getModality ai
         }
@@ -503,7 +509,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
         { localBinder      = printed (Binder (ReifiedName n x) ty False)
         , localBindingSite = toUpdatedPosition delta (nameBindingSite name)
         , localValue       = Just (printed (Binder (ReifiedName n x) v True))
-        , localInScope     = s == C.InScope
+        , localFlags       = flags s (domInfo dom)
         , localHiding      = getHiding (domInfo dom)
         , localModality    = getModality (domInfo dom)
         }
@@ -513,15 +519,15 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
 
   ctx <- getContext
   let locals = zipWith raise [1..] ctx
-  locals <- catMaybes <$> forM locals mkVar
+  locals <- catMaybes <$> for locals mkVar
 
   lets <- Map.toAscList <$> asksTC envLetBindings
-  lets <- catMaybes <$> forM lets mkLet
+  lets <- catMaybes <$> for lets mkLet
 
   boundary <- liftTCM $ B.getIPBoundary AsIs iid
 
   pure GoalInfo
-    { goalGoal     = Goal iid (fromMaybe (toLsp (ipRange ip)) (getCurrentInteractionRange posInfo ip)) gty
+    { goalGoal     = Goal iid (fromMaybe (toLsp (ipRange ip)) (getCurrentInteractionRange posInfo ip)) (Just gty)
     , goalContext  = lets ++ locals
     , goalBoundary = case boundary of
         [] -> Nothing
@@ -577,28 +583,10 @@ localCompletionItem ix var@Dom{unDom = (name, ty)} = liftTCM $ runMaybeT do
     & labelDetails ?~ CompletionItemLabelDetails (Just (" : " <> ty)) Nothing
     & kind         ?~ CompletionItemKind_Variable
 
-headMatches :: Maybe Type -> Type -> TCM Bool
-headMatches Nothing _ = pure True
-headMatches (Just t) t' = do
-  TelV ctx t' <- telView t'
-  addContext ctx do
-  t' <- fmap unEl <$> reduceB t'
-  t <- reduce (raise (Prelude.length ctx) t)
-  case (ignoreBlocking t', unEl t) of
-    (Var{}, _)   -> pure True
-    (_, MetaV{}) -> pure True
-    (MetaV{}, _) -> pure True
-    (Def q _, _)
-      | Blocked{} <- t'    -> pure True
-      | Def q' _ <- unEl t -> pure $! q == q'
-    (Sort{},  Sort{})  -> pure True
-    (Level{}, Level{}) -> pure True
-    _ -> pure False
-
-definedCompletionItem :: Maybe Type -> QName -> Task (Maybe CompletionItem)
-definedCompletionItem _ qnm | isExtendedLambdaName qnm = pure Nothing
-definedCompletionItem _ qnm | isAbsurdLambdaName qnm = pure Nothing
-definedCompletionItem want qnm = getConstInfo qnm >>= \def -> runMaybeT do
+definedCompletionItem :: QName -> Task (Maybe CompletionItem)
+definedCompletionItem qnm | isExtendedLambdaName qnm = pure Nothing
+definedCompletionItem qnm | isAbsurdLambdaName qnm = pure Nothing
+definedCompletionItem qnm = getConstInfo qnm >>= \def -> runMaybeT do
   name <- Text.pack . Ppr.render <$> lift (prettyTCM qnm)
 
   let
@@ -612,7 +600,6 @@ definedCompletionItem want qnm = getConstInfo qnm >>= \def -> runMaybeT do
       I.Constructor{}                     -> Just CompletionItemKind_EnumMember
       _                                   -> Nothing
 
-  guard =<< liftTCM (headMatches want (defType def))
   ty <- Text.pack . Ppr.render <$> lift (inTopContext (prettyATop =<< reify (defType def)))
 
   pure $! namedCompletionItem name
@@ -626,7 +613,7 @@ completion = requestHandlerTCM SMethod_TextDocumentCompletion (view (params . te
     comp <- traverse (uncurry localCompletionItem) (zip [0..] ctx)
 
     want  <- traverse getMetaTypeInContext (ipMeta ip)
-    comp' <- traverse (definedCompletionItem want) . Set.toList =<< fmap (^. scopeInScope) getScope
+    comp' <- traverse definedCompletionItem . Set.toList =<< fmap (^. scopeInScope) getScope
 
     reportSLn "lsp.completion" 10 $ show req
     res (Right (InL (catMaybes comp ++ catMaybes comp')))

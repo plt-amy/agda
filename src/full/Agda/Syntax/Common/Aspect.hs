@@ -81,6 +81,8 @@ data OtherAspect
   -- more important, aspects in the emacs mode.
   | CatchallClause
   | ConfluenceProblem
+  | Subtree
+    -- ^ Marker for logical subtrees in pretty-printed output
     deriving (Eq, Ord, Show, Enum, Bounded, Generic)
 
 -- | Some 'NameKind's are more informative than others.

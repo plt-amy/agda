@@ -548,6 +548,7 @@ library
       Agda.LSP.Main
       Agda.LSP.Commands
       Agda.LSP.Goal
+      Agda.LSP.Diagnostic
       Agda.LSP.Monad.Base
       Agda.LSP.Output
       Agda.LSP.Position

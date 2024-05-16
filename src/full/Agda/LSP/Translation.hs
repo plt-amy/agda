@@ -56,44 +56,6 @@ instance ToLsp (Range' a) where
         is' = toList is
       in toLsp (Interval (iStart (head is')) (iEnd (last is')))
 
-errorToDiagnostic :: TCErr -> TCM [Lsp.Diagnostic]
-errorToDiagnostic =
-  \case
-    err@TypeError{} -> do
-      msg <- unlines . tail . lines . render <$> prettyTCM err
-
-      let
-        diag = withRangeMsg (getRange err) msg
-
-      diag <- pure case clValue (tcErrClosErr err) of
-        ClashingDefinition _ old _ -> diag &
-          set Lsp.relatedInformation
-            (Just [ Lsp.DiagnosticRelatedInformation
-              { _location = Lsp.Location
-                  (Lsp.filePathToUri (filePath (rangeFilePath (Strict.fromJust (rangeFile (nameBindingSite (qnameName old)))))))
-                  (toLsp (nameBindingSite (qnameName old)))
-              , _message  = "Previous definition here"
-              } ])
-        _ -> diag
-
-      pure [diag]
-
-    Exception r d     -> pure $ [withRangeMsg r $ render d]
-    IOException _ r e -> pure $ [withRangeMsg r $ show e]
-    PatternErr{} -> __IMPOSSIBLE__
-  where
-    withRangeMsg r msg = Lsp.Diagnostic
-      { _range              = toLsp r
-      , _severity           = Just Lsp.DiagnosticSeverity_Error
-      , _code               = Nothing
-      , _codeDescription    = Nothing
-      , _source             = Just "agda"
-      , _message            = Text.pack msg
-      , _tags               = Nothing
-      , _relatedInformation = Nothing
-      , _data_              = Nothing
-      }
-
 instance ToLsp Aspect where
   type LspType Aspect = Lsp.SemanticTokenTypes
   toLsp = \case

@@ -1,3 +1,4 @@
+{-# LANGUAGE RoleAnnotations #-}
 module Agda.LSP.Output
   ( Printed
   , printed
@@ -51,10 +52,11 @@ renderToJSON = toJSON . Ppr.fullRenderAnn Ppr.PageMode 100 1.5 cont [] where
     Ppr.AnnotStart  -> annotate [] acc
     Ppr.NoAnnot d _ -> consText d acc
     Ppr.AnnotEnd a
-      | Just asp <- aspect a -> Mark (Just a):acc
+      | _:_ <- toAtoms a -> Mark (Just a):acc
       | otherwise -> Mark Nothing:acc -- uncurry (<>) (break acc)
 
 newtype Printed a = Printed { getPrinted :: Doc }
+type role Printed nominal
 
 printed :: Pretty a => a -> Printed a
 printed = Printed . pretty

@@ -212,3 +212,6 @@ withPosition pos cont = do
   case containing of
     Just (iid, ip, _) -> Just <$> withInteractionId iid (cont ip)
     Nothing -> pure Nothing
+
+detachTask :: Task a -> Task ()
+detachTask k = withRunInIO \run -> void . forkIO $ run (void k)
