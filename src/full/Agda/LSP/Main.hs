@@ -10,9 +10,9 @@ import Control.Monad.IO.Class
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
 import Control.Monad.Except (MonadError(catchError))
+import Control.Applicative
 import Control.Concurrent
 import Control.Exception
-import Control.Monad
 
 import qualified Data.Text.Utf16.Rope.Mixed as Rope
 import qualified Data.HashMap.Strict as HashMap
@@ -111,7 +111,6 @@ import Agda.Syntax.Parser (runPMIO)
 import Agda.Mimer.Mimer as Mimer
 import qualified Agda.Syntax.Parser as P
 import qualified Agda.Utils.Maybe.Strict as Strict
-import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
 import Agda.Syntax.Common (InteractionId, LensModality (getModality), LensHiding (getHiding))
 import Agda.Syntax.Fixity (Precedence(TopCtx))
 
@@ -250,11 +249,11 @@ updateInteractionRanges text = do
   path <- theSourceFile
 
   (parseResult, _) <- liftIO . Pa.runPMIO $ Pa.parseFile Pa.tokensParser (RangeFile (srcFilePath path) Nothing) (Text.unpack text)
-  setInteractionPointRanges . mapMaybe findInteractionPoint $ either (const []) (fst . fst) parseResult
+  setInteractionPointRanges . mapMaybe (fmap toLsp . findInteractionPointToken) $ either (const []) (fst . fst) parseResult
 
-  where
-    findInteractionPoint (TokSymbol SymQuestionMark ival) = Just (toLsp ival)
-    findInteractionPoint _ = Nothing
+findInteractionPointToken :: T.Token -> Maybe Interval
+findInteractionPointToken (T.TokSymbol T.SymQuestionMark ival) = Just ival
+findInteractionPointToken _ = Nothing
 
 onTextDocumentOpen :: Handlers WorkerM
 onTextDocumentOpen = notificationHandler SMethod_TextDocumentDidOpen \notif ->
@@ -641,7 +640,7 @@ onTypeFormatting = requestHandler SMethod_TextDocumentOnTypeFormatting \req res 
         linum = req ^. params . position . line
         l = Text.lines text !! fromIntegral linum
 
-        edit (TokSymbol SymQuestionMark ival)
+        edit (T.TokSymbol T.SymQuestionMark ival)
           | posPos (iEnd ival) == posPos (iStart ival) + 1
           = pure $ TextEdit {_newText="{! !}", _range=toLsp ival}
         edit _ = []
@@ -852,33 +851,42 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
       -- Clear the highlighting
       setTCLens stSyntaxInfo mempty
       -- Apply our edit, this will fill any new highlighting information
-      (edit@(TextEdit range replacement), offset) <- makeEdit
+      (TextEdit range replacement, offset) <- makeEdit
+
+      (replacement', remapPos) <- liftIO $ rewriteHoles replacement
 
       let
-        newContents = applyEditNow range replacement fileContents
-        newDelta = posDeltaWithChange (posInfoDelta posInfo) range replacement
+        newContents = applyEditNow range replacement' fileContents
+        newDelta = posDeltaWithChange (posInfoDelta posInfo) range replacement'
         newSyntaxInfo = updateRangeMap newDelta newContents oldSyntaxInfo
 
-        updatePoint (ii, ip)
-          -- If we're a new interaction point, move it by two.
+        newRange = toAgdaRange newContents Null.empty range
+        remapPos' x = remapPos newRange (x - offset)
+
+        updatePoints _ [] = []
+        updatePoints rs ((ii, ip):xs)
+          -- If we're a new interaction point, use the range from the source code
           | not (BiMap.source ii oldInteractionPoints)
-          = (ii, ip { ipRange = modifyRangePositions (\x -> x - offset) newContents (ipRange ip) })
+          = let (r, rs') = uncons rs in (ii, ip { ipRange = r }):updatePoints rs' xs
           -- If we're an existing point, attempt to remap the position
           | Just pos <- getCurrentInteractionRange posInfo { posInfoDelta = newDelta } ip
-          = (ii, ip { ipRange = toAgdaRange newContents (rangeFile (ipRange ip)) pos })
+          = (ii, ip { ipRange = toAgdaRange newContents (rangeFile (ipRange ip)) pos }):updatePoints rs xs
           -- Otherwise ignore.
-          | otherwise = (ii, ip)
+          | otherwise = (ii, ip):updatePoints rs xs
 
-      replacementTokens <- generateTokenInfoFromString (toAgdaRange newContents Null.empty range) (Text.unpack replacement)
+      replacementTokens <- generateTokenInfoFromString newRange (Text.unpack replacement')
 
       -- Offset any new highlighting information, and then add back the (now remapped)
       -- information.
-      modifyTCLens stSyntaxInfo ((replacementTokens <> ) . (newSyntaxInfo <>) . modifyRangeMapPositions (\x -> x - offset))
+      modifyTCLens stSyntaxInfo ((replacementTokens <> ) . (newSyntaxInfo <>) . modifyRangeMapPositions remapPos')
 
-      -- Offset all interaction points.
-      modifyTCLens stInteractionPoints (BiMap.fromList . map updatePoint . BiMap.toList)
+      -- Reparse the input string to the find the interaction points, and use that to correct
+      -- the position of the interaction points. Refine will produce entirely incorrect
+      -- positions, so it's easier to start from scratch than try to offset.
+      ipRanges <- liftIO $ mapMaybe (fmap getRange . findInteractionPointToken) . fromJust <$> getTokens (fromJust (rStart newRange)) replacement'
+      modifyTCLens stInteractionPoints (BiMap.fromList . updatePoints ipRanges . BiMap.toList)
 
-      pure (edit, newContents)
+      pure (TextEdit range replacement', newContents)
 
     giveHandler
       :: Text.Text -> (UseForce -> InteractionId -> Maybe Agda.Range -> A.Expr -> TCM A.Expr)
@@ -898,8 +906,6 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
       fileContents <- view file_text . fromJust <$> theVirtualFile
 
       ((edit, fileContents'), state) <- snapshotTCM $ removeHighlightingFor (ipRange ip) >> rewritePositions posInfo fileContents do
-        -- TODO: Run lexer on the contents and replace ? for {! !}
-        -- before parsing, so the ranges are correct
         given <- B.parseExprIn ii inner (Text.unpack contents)
         res <- give WithoutForce ii Nothing given
         ce <- abstractToConcreteScope scope res
@@ -911,6 +917,7 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
           (replacement, offset') =
             if given == res
             then case ce of
+              -- FIXME: Handle the case where we already have parens.
               C.Paren{} -> ("(" <> contents <> ")", offset - 1)
               _ -> (contents, offset)
             else (Text.pack (prettyShow ce), offset)
@@ -929,6 +936,50 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
        }
 
       pure (Right (InR Lsp.Null))
+
+    getTokens :: Agda.Position -> Text.Text -> IO (Maybe [T.Token])
+    getTokens pos txt = either (const Nothing) (Just . fst) . fst <$> Pa.runPMIO (Pa.parsePosString Pa.tokensParser pos (Text.unpack txt))
+
+    -- Rewrite any holes in the expression, replacing "?" with "{!!}" and
+    -- returning a function that offsets positions to adjust for this.
+    rewriteHoles :: Text.Text -> IO (Text.Text, Agda.Range -> Int -> Int)
+    rewriteHoles txt = do
+      toks <- getTokens (Agda.Pn Null.empty 1 1 1) txt
+      pure case toks of
+        Nothing -> (txt, \_ x -> x)
+        Just toks ->
+          let
+            (txts, ips, map) = rewriteHoleWorker txt toks 0 0
+            remapPos range pos =
+              let
+                -- Adjust the position to be relative to the start of the document.
+                pos' = pos - 1 - maybe 0 posOffset (rStart range)
+                -- Then find the offset at or before the current character.
+                (before, now, _) = Map.splitLookup pos' map
+                offset = fromMaybe 0 $ now <|> (snd <$> Map.lookupMax before)
+              -- And use it to offset
+              in pos + offset
+          in (Text.concat txts, remapPos)
+
+    rewriteHoleWorker
+      :: Text.Text -- The input text.
+      -> [T.Token] -- The remaining token stream
+      -> Int       -- The position of the last token emitted
+      -> Int       -- The cumulative offset
+      -> ([Text.Text], [(Int, Int)], Map.Map Int Int)
+    rewriteHoleWorker txt [] p _ = ([Text.drop p txt], [], mempty)
+    rewriteHoleWorker txt (T.TokSymbol T.SymQuestionMark ival:ts) p o
+      | start <- posOffset (iStart ival), end <- posOffset (iEnd ival)
+      , start + 1 == end =
+        let (txts, ips, map) = rewriteHoleWorker txt ts end (o + 3)
+        in (substring p start txt:"{!!}":txts, ips, Map.insert end (o + 3) map)
+    rewriteHoleWorker txt (t:ts) p o = rewriteHoleWorker txt ts p o
+
+    substring start end = Text.take (end - start) . Text.drop start
+    posOffset x = fromIntegral (posPos x) - 1
+
+    uncons [] = Prelude.error "Expected non-empty list"
+    uncons (x:xs) = (x, xs)
 
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers caps = mconcat

@@ -13,7 +13,6 @@ import Test.Tasty.HUnit
 
 import Internal.Helpers
 import Internal.Interaction.Lsp.Utils
-import Control.Applicative.Combinators
 
 import Agda.LSP.Commands
 import Agda.LSP.Goal
@@ -26,7 +25,6 @@ giveAddsParentheses = testCase "Give adds parentheses" $ runAgdaSession def lspR
   waitForSuccessfulReload
 
   insertText doc (Position 7 23) "add {!!} {!!} "
-  (liftIO . print) =<< documentContents doc
 
   [Goal {goalRange = Range (Position 7 20) (Position 7 39)}] <- goalQuery doc Query_AllGoals
   res <- executeCommand (toCommand "Give" (Command_Give uriDoc (Position 7 20)))
@@ -39,7 +37,45 @@ giveAddsParentheses = testCase "Give adds parentheses" $ runAgdaSession def lspR
 
   pure ()
 
+giveReplacesHoles :: TestTree
+giveReplacesHoles = testCase "Give replaces holes" $ runAgdaSession def lspRoot $ do
+  doc <- openDoc "Give.agda" "agda"
+  let uriDoc = doc ^. Lsp.uri
+  waitForSuccessfulReload
+
+  insertText doc (Position 7 23) "add ? (suc ?) "
+
+  [Goal {goalRange = Range (Position 7 20) (Position 7 39)}] <- goalQuery doc Query_AllGoals
+  res <- executeCommand (toCommand "Give" (Command_Give uriDoc (Position 7 20)))
+
+  newContents <- getDocumentEdit doc
+  liftIO $ Text.lines newContents !! 7 @?= "add (suc x) y = suc (add {!!} (suc {!!}))"
+
+  ( [ Goal {goalRange = Range (Position 7 25) (Position 7 29)}
+    , Goal {goalRange = Range (Position 7 35) (Position 7 39)} ] ) <- goalQuery doc Query_AllGoals
+
+  tokens <- getAbsSemanticTokens doc
+  let
+    token = SemanticTokenAbsolute
+      { _line = 7
+      , _startChar = 31
+      , _length = 3
+      , _tokenType = SemanticTokenTypes_EnumMember
+      , _tokenModifiers = []
+      }
+  liftIO $ elem token tokens @? "Expected updated [" ++ concat (map (\x -> "\n  " ++ show x) tokens) ++ " ] to contain " ++ show token
+
+  -- Save the file and assert they are the same.
+  saveFile doc
+  waitForSuccessfulReload
+
+  tokens' <- getAbsSemanticTokens doc
+  liftIO $ tokens' @?= tokens
+
+  pure ()
+
 tests :: TestTree
 tests = testGroup "Internal.Interaction.Lsp.Interaction"
   [ giveAddsParentheses
+  , giveReplacesHoles
   ]

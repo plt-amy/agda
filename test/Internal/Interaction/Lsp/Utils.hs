@@ -88,6 +88,13 @@ waitForSuccessfulReload = do
   diags <- waitForReload
   when (diags /= []) $ liftIO $ throw UnexpectedDiagnostics
 
+-- | Wait for an Agda file to be reloaded, and assert that it reported no errors.
+saveFile :: TextDocumentIdentifier -> Session ()
+saveFile doc = sendNotification SMethod_TextDocumentDidSave DidSaveTextDocumentParams
+  { _textDocument = doc
+  , _text = Nothing
+  }
+
 -- | Change some text in a range.
 changeText :: TextDocumentIdentifier -> Range -> String -> Session ()
 changeText doc range text = changeDoc doc [TextDocumentContentChangeEvent (InL (TextDocumentContentChangePartial range Nothing (Text.pack text)))]
