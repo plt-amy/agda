@@ -116,20 +116,6 @@ getAbsSemanticTokens doc = do
     InL t -> absolutizeTokens . decodeTokens . view data_ $ t
     InR _ -> []
 
-
--- Evil orphan instances for the goal results. These allow us to parse results
--- in tests, but are fundamentally unsafe.
-
-instance FromJSON (Printed C.Expr) where
-  parseJSON _ = pure . Printed $ C.Lit noRange (LitString "<opaque>")
-
-instance FromJSON (Printed C.Name) where
-  parseJSON _ = pure . Printed $ C.noName noRange
-
-instance FromJSON Goal
-instance FromJSON Local
-instance FromJSON GoalInfo
-
 -- | Query the agda server
 goalQuery :: (HasCallStack, ToJSON a) => TextDocumentIdentifier -> Query a -> Session a
 goalQuery doc query = do

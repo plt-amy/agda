@@ -8,7 +8,7 @@ import Control.Monad.Trans.Maybe
 import Control.Monad.IO.Class
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
-import Control.Monad.Except hiding (tryError)
+import Control.Monad.Except (MonadError(catchError))
 import Control.Concurrent
 import Control.Exception
 import Control.Monad
@@ -105,7 +105,7 @@ import Agda.Interaction.Base (Rewrite(AsIs), UseForce (WithoutForce))
 
 import Agda.LSP.Monad.Base
 import Agda.LSP.Commands
-import Agda.LSP.Output (Printed(Printed), renderToJSON)
+import Agda.LSP.Output
 import Agda.Interaction.InteractionTop (highlightExpr)
 import Agda.Interaction.Highlighting.Range (rangeToRange)
 import Agda.Interaction.Options.Lenses
@@ -429,7 +429,7 @@ fillQuery Query_AllGoals = do
   iis <- getActiveInteractionPoints
   forM iis \(id, ip, range) -> withInteractionId id do
     mi <- lookupInteractionId id
-    ty <- fmap Printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
+    ty <- fmap printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
     pure Goal
       { goalId       = id
       , goalType     = ty
@@ -453,7 +453,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
       con <- abstractToConcreteCtx TopCtx =<< reify (unEl t)
 
       pure $ Just Local
-        { localBinder      = Printed (Binder (ReifiedName n x) con False)
+        { localBinder      = printed (Binder (ReifiedName n x) con False)
         , localValue       = Nothing
         , localBindingSite = updatePosition delta (toLsp (nameBindingSite name))
         , localInScope     = s == C.InScope
@@ -473,16 +473,16 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
       v <- abstractToConcreteCtx TopCtx =<< liftTCM (removeLetBindingsFrom name (reifyUnblocked =<< normalForm AsIs tm))
 
       pure $ Just Local
-        { localBinder      = Printed (Binder (ReifiedName n x) ty False)
+        { localBinder      = printed (Binder (ReifiedName n x) ty False)
         , localBindingSite = updatePosition delta (toLsp (nameBindingSite name))
-        , localValue       = Just (Printed (Binder (ReifiedName n x) v True))
+        , localValue       = Just (printed (Binder (ReifiedName n x) v True))
         , localInScope     = s == C.InScope
         , localHiding      = getHiding (domInfo dom)
         , localModality    = getModality (domInfo dom)
         }
 
 
-  gty <- fmap Printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
+  gty <- fmap printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
 
   ctx <- getContext
   let locals = zipWith raise [1..] ctx
@@ -498,7 +498,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
     , goalContext  = lets ++ locals
     , goalBoundary = case boundary of
         [] -> Nothing
-        xs -> Just $! map Printed xs
+        xs -> Just $! map printed xs
     }
 
 goal :: Handlers WorkerM
