@@ -53,6 +53,7 @@ import qualified Text.PrettyPrint.Annotated.HughesPJ as Ppr
 import qualified Text.PrettyPrint.Annotated as Ppr
 
 import qualified Agda.Syntax.Concrete as C
+import qualified Agda.Syntax.Abstract as A
 import qualified Agda.Syntax.Position as Agda
 
 import Agda.Syntax.Translation.InternalToAbstract (Reify(reify), reifyUnblocked)
@@ -70,6 +71,7 @@ import Agda.TypeChecking.Telescope
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Monad as I
+import Agda.TypeChecking.Opacity (saturateOpaqueBlocks)
 
 import qualified Agda.Syntax.Parser as Pa
 import qualified Agda.Syntax.Parser.Tokens as T
@@ -143,7 +145,7 @@ runAgdaLSP setup = do
     , options          = def
       { optTextDocumentSync = Just syncOptions
       , optDocumentOnTypeFormattingTriggerCharacters = Just ('?' :| [])
-      , optExecuteCommandCommands = Just (map commandName [minBound..maxBound])
+      , optExecuteCommandCommands = Just commandNames
       }
     }
 
@@ -745,8 +747,9 @@ getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params 
     [] -> InL []
     [(range, nonEmpty)] -> InL $
       [ InR $ makeCodeAction "Run proof search on this goal" (Command_Auto fileUri (range ^. start)) ] ++
-      -- TODO: Refine
-      [ InR $ makeCodeAction "Fill goal with current contents" (Command_Give fileUri (range ^. start)) | nonEmpty ]
+      [ InR $ makeCodeAction "Fill goal with current contents" (Command_Give fileUri (range ^. start)) | nonEmpty ] ++
+      [ InR $ makeCodeAction "Refine goal" (Command_Refine fileUri (range ^. start)) | nonEmpty ] ++
+      [ InR $ makeCodeAction "Introduce term" (Command_Intro fileUri (range ^. start)) | not nonEmpty ]
     _ -> InL []
 
   where
@@ -797,9 +800,9 @@ removeHighlightingFor x = modifyTCLens' stSyntaxInfo \map -> snd (insideAndOutsi
 
 executeAgdaCommand :: Handlers WorkerM
 executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
-  case parseCommand (req ^. params . command) (fromMaybe [] (req ^. params . arguments)) of
-    Nothing -> res (Left (ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot parse command" Nothing))
-    Just (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, _, contents) -> do
+  case parseCommand (req ^. params) of
+    Aeson.Error e -> res (Left (ResponseError (InL LSPErrorCodes_RequestFailed) (Text.pack e) Nothing))
+    Aeson.Success (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, _, contents) -> do
       -- TODO: What's the proper range here? This gets passed from the elisp side, so
       -- I think it's the *inside* of the interaction point, after edits have been applied.
       result <- Mimer.mimer ii inner (Text.unpack contents)
@@ -813,40 +816,15 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
 
       pure (Right (InR Lsp.Null))
 
-    Just (Command_Give uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, offset, contents) -> do
-      scope <- getInteractionScope ii
-
-      posInfo <- getPositionInfo
-      fileContents <- view file_text . fromJust <$> theVirtualFile
-
-      ((edit, fileContents'), state) <- snapshotTCM $ removeHighlightingFor (ipRange ip) >> rewritePositions posInfo fileContents do
-        -- TODO: Run lexer on the contents and replace ? for {! !}
-        -- before parsing, so the ranges are correct
-        given <- B.parseExprIn ii inner (Text.unpack contents)
-        res <- B.give WithoutForce ii Nothing given
-        ce <- abstractToConcreteScope scope res
-
-        let
-          (replacement, offset') =
-            if given == res
-            then case ce of
-              C.Paren{} -> ("(" <> contents <> ")", offset - 1)
-              _ -> (contents, offset)
-            else (Text.pack (prettyShow ce), offset)
-
-        highlightExpr res
-        pure (TextEdit range replacement, offset')
-
-      applyEdit "Give" (Map.singleton uri [edit])
-
-      let fileLines = Rope.toTextLines fileContents'
-      setSnapshot . Just $ StateSnapshot
-        { snapshotText = TextLines.toText fileLines
-        , snapshotTc = state
-        , snapshotPosition = createPosDelta fileLines
-       }
-
-      pure (Right (InR Lsp.Null))
+    Aeson.Success (Command_Give uri pos) -> giveHandler "Give" B.give uri pos res
+    Aeson.Success (Command_Refine uri pos) -> giveHandler "Refine" B.refine uri pos res
+    Aeson.Success (Command_ElaborateAndGive uri pos) -> giveHandler "Elaborate and give" (B.elaborate_give AsIs) uri pos res
+    Aeson.Success (Command_Intro uri pos) -> commandHandlerInteractionPoint uri pos res \ipi@(ii, _, _) (range, offset, _) -> do
+      ss <- liftTCM $ B.introTactic False ii -- TODO: pattern matching lambda?
+      case ss of
+        [] -> showMessage MessageType_Error "No introduction forms found." >> pure (Right (InR Lsp.Null))
+        [s] -> runGive "Introduce" B.refine ipi (range, offset, Text.pack s)
+        _:_:_ -> showMessage MessageType_Error "Multiple introduction forms found." >> pure (Right (InR Lsp.Null))
 
   where
     showMessage kind msg = void $ sendNotification SMethod_WindowShowMessage $ ShowMessageParams kind msg
@@ -911,6 +889,55 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
       modifyTCLens stInteractionPoints (BiMap.fromList . map updatePoint . BiMap.toList)
 
       pure (edit, newContents)
+
+    giveHandler
+      :: Text.Text -> (UseForce -> InteractionId -> Maybe Agda.Range -> A.Expr -> TCM A.Expr)
+      -> Uri -> Lsp.Position -> (Either ResponseError (Value |? Null) -> WorkerM ())
+      -> WorkerM ()
+    giveHandler name give uri pos res = commandHandlerInteractionPoint uri pos res (runGive name give)
+
+    runGive
+      :: Text.Text -> (UseForce -> InteractionId -> Maybe Agda.Range -> A.Expr -> TCM A.Expr)
+      -> InteractionPointInfo -> (Agda.Range, Int, Text.Text)
+      -> Task (Either ResponseError (Value |? Null))
+    runGive name give (ii, ip, range) (inner, offset, contents) = do
+      scope <- getInteractionScope ii
+
+      uri <- theURI
+      posInfo <- getPositionInfo
+      fileContents <- view file_text . fromJust <$> theVirtualFile
+
+      ((edit, fileContents'), state) <- snapshotTCM $ removeHighlightingFor (ipRange ip) >> rewritePositions posInfo fileContents do
+        -- TODO: Run lexer on the contents and replace ? for {! !}
+        -- before parsing, so the ranges are correct
+        given <- B.parseExprIn ii inner (Text.unpack contents)
+        res <- give WithoutForce ii Nothing given
+        ce <- abstractToConcreteScope scope res
+
+        -- Issue 7218. See also InteractionTop
+        saturateOpaqueBlocks
+
+        let
+          (replacement, offset') =
+            if given == res
+            then case ce of
+              C.Paren{} -> ("(" <> contents <> ")", offset - 1)
+              _ -> (contents, offset)
+            else (Text.pack (prettyShow ce), offset)
+
+        highlightExpr res
+        pure (TextEdit range replacement, offset')
+
+      applyEdit name (Map.singleton uri [edit])
+
+      let fileLines = Rope.toTextLines fileContents'
+      setSnapshot . Just $ StateSnapshot
+        { snapshotText = TextLines.toText fileLines
+        , snapshotTc = state
+        , snapshotPosition = createPosDelta fileLines
+       }
+
+      pure (Right (InR Lsp.Null))
 
 lspHandlers :: ClientCapabilities -> Handlers WorkerM
 lspHandlers caps = mconcat
