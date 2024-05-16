@@ -16,10 +16,10 @@ import qualified Data.Map.Strict as Map
 import Data.HashMap.Strict (HashMap)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
-
-import Data.Aeson
-import Data.IORef
 import Data.List (find)
+import Data.Aeson
+import Data.Maybe
+import Data.IORef
 
 import GHC.Generics
 
@@ -46,9 +46,6 @@ import Agda.Utils.Impossible (__IMPOSSIBLE__)
 import Agda.Utils.Functor
 import Agda.Utils.Maybe (fromMaybe, mapMaybe)
 import Agda.Utils.Lens
-import Agda.LSP.Translation
-
-import qualified Debug.Trace as DT
 
 data LspConfig = LspConfig
   { lspHighlightingLevel :: HighlightingLevel

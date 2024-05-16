@@ -546,12 +546,13 @@ library
       Agda.Interaction.Options.Lenses
       Agda.Interaction.Options.Warnings
       Agda.LSP.Main
+      Agda.LSP.Commands
       Agda.LSP.Goal
       Agda.LSP.Monad.Base
       Agda.LSP.Output
-      Agda.LSP.Commands
       Agda.LSP.Position
       Agda.LSP.Translation
+      Agda.LSP.Utils
       Agda.Main
       Agda.Mimer.Mimer
       Agda.Mimer.Options

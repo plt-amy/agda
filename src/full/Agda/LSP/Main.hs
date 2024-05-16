@@ -78,16 +78,23 @@ import qualified Agda.Syntax.Parser.Tokens as T
 
 import Agda.LSP.Translation
 import Agda.LSP.Position
+import Agda.LSP.Utils
 import Agda.LSP.Goal
 
 import qualified Agda.Interaction.Imports as Imp
 import qualified Agda.Interaction.BasicOps as B
 import Agda.Interaction.Highlighting.Precise
 import Agda.Interaction.Highlighting.Common (toAtoms)
+import Agda.Interaction.InteractionTop (highlightExpr)
+import Agda.Interaction.Highlighting.Range (rangeToRange)
+import Agda.Interaction.Highlighting.Generate (generateTokenInfoFromString)
+import Agda.Interaction.Base (Rewrite(AsIs), UseForce (WithoutForce))
 import Agda.Interaction.Response.Base
 import Agda.Interaction.FindFile (SourceFile(..))
 import Agda.Interaction.BasicOps (getWarningsAndNonFatalErrors, normalForm)
 import Agda.Interaction.JSONTop () -- Instances only
+import Agda.Interaction.Options.Lenses
+import Agda.Interaction.Options
 
 import qualified Agda.Utils.RangeMap as RangeMap
 import Agda.Utils.RangeMap (RangeMap)
@@ -107,17 +114,10 @@ import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
 import Agda.Syntax.Common (InteractionId, LensModality (getModality), LensHiding (getHiding))
 import Agda.Syntax.Fixity (Precedence(TopCtx))
-import Agda.Interaction.Base (Rewrite(AsIs), UseForce (WithoutForce))
 
 import Agda.LSP.Monad.Base
 import Agda.LSP.Commands
 import Agda.LSP.Output
-import Agda.Interaction.InteractionTop (highlightExpr)
-import Agda.Interaction.Highlighting.Range (rangeToRange)
-import Agda.Interaction.Options.Lenses
-import Agda.Interaction.Options
-
-import qualified Debug.Trace as DT
 
 syncOptions :: TextDocumentSyncOptions
 syncOptions = TextDocumentSyncOptions
@@ -161,9 +161,9 @@ lspOutputCallback uri config = liftIO . runLspT config . \case
 lspInit
   :: TCM ()
   -> LanguageContextEnv LspConfig
-  -> a
+  -> TMessage 'Method_Initialize
   -> IO (Either ResponseError LspState)
-lspInit setup config _ = do
+lspInit setup config init = do
   workers  <- newMVar mempty
 
   (opts, _) <- runTCM initEnv initState do
@@ -807,9 +807,9 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
       -- I think it's the *inside* of the interaction point, after edits have been applied.
       result <- Mimer.mimer ii inner (Text.unpack contents)
       case result of
-        Mimer.MimerNoResult -> showMessage MessageType_Error "No solution found"
-        MimerExpr str -> applyEdit "Proof Search" (Map.singleton uri [TextEdit range (Text.pack str)])
-        MimerList sols -> showMessage MessageType_Info . Text.pack $
+        Mimer.MimerNoResult -> showWorkspaceMessage MessageType_Error "No solution found"
+        MimerExpr str -> sendWorkspaceEdit "Proof Search" (Map.singleton uri [TextEdit range (Text.pack str)])
+        MimerList sols -> showWorkspaceMessage MessageType_Info . Text.pack $
             "Multiple solutions:" ++
             intercalate "\n" ["  " ++ show i ++ ". " ++ s | (i, s) <- sols]
         MimerClauses{} -> __IMPOSSIBLE__    -- Mimer can't do case splitting yet
@@ -822,27 +822,15 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
     Aeson.Success (Command_Intro uri pos) -> commandHandlerInteractionPoint uri pos res \ipi@(ii, _, _) (range, offset, _) -> do
       ss <- liftTCM $ B.introTactic False ii -- TODO: pattern matching lambda?
       case ss of
-        [] -> showMessage MessageType_Error "No introduction forms found." >> pure (Right (InR Lsp.Null))
+        [] -> showWorkspaceMessage MessageType_Error "No introduction forms found." >> pure (Right (InR Lsp.Null))
         [s] -> runGive "Introduce" B.refine ipi (range, offset, Text.pack s)
-        _:_:_ -> showMessage MessageType_Error "Multiple introduction forms found." >> pure (Right (InR Lsp.Null))
+        _:_:_ -> showWorkspaceMessage MessageType_Error "Multiple introduction forms found." >> pure (Right (InR Lsp.Null))
 
   where
-    showMessage kind msg = void $ sendNotification SMethod_WindowShowMessage $ ShowMessageParams kind msg
-
     applyEditNow range replacement contents
       = runIdentity . applyChange mempty contents
       . TextDocumentContentChangeEvent . InL
       $ TextDocumentContentChangePartial range Nothing replacement
-
-    applyEdit title changes =
-      let
-        edit = ApplyWorkspaceEditParams (Just title) $ WorkspaceEdit
-          { _changes = Just changes
-          , _documentChanges = Nothing
-          , _changeAnnotations = Nothing
-          }
-      in void $ sendRequest SMethod_WorkspaceApplyEdit edit (\_ ->
-        void $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ())))
 
     snapshotTCM :: TCM a -> Task (a, TCState)
     snapshotTCM task = do
@@ -881,9 +869,11 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
           -- Otherwise ignore.
           | otherwise = (ii, ip)
 
+      replacementTokens <- generateTokenInfoFromString (toAgdaRange newContents Null.empty range) (Text.unpack replacement)
+
       -- Offset any new highlighting information, and then add back the (now remapped)
       -- information.
-      modifyTCLens stSyntaxInfo ((newSyntaxInfo <>) . modifyRangeMapPositions (\x -> x - offset))
+      modifyTCLens stSyntaxInfo ((replacementTokens <> ) . (newSyntaxInfo <>) . modifyRangeMapPositions (\x -> x - offset))
 
       -- Offset all interaction points.
       modifyTCLens stInteractionPoints (BiMap.fromList . map updatePoint . BiMap.toList)
@@ -926,9 +916,10 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
             else (Text.pack (prettyShow ce), offset)
 
         highlightExpr res
+
         pure (TextEdit range replacement, offset')
 
-      applyEdit name (Map.singleton uri [edit])
+      sendWorkspaceEdit name (Map.singleton uri [edit])
 
       let fileLines = Rope.toTextLines fileContents'
       setSnapshot . Just $ StateSnapshot
