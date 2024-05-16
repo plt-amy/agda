@@ -1,5 +1,6 @@
 module Agda.LSP.Output
-  ( Printed(..)
+  ( Printed
+  , printed
   , renderToJSON
   )
   where
@@ -53,10 +54,18 @@ renderToJSON = toJSON . Ppr.fullRenderAnn Ppr.PageMode 100 1.5 cont [] where
       | Just asp <- aspect a -> Mark (Just a):acc
       | otherwise -> Mark Nothing:acc -- uncurry (<>) (break acc)
 
-newtype Printed a = Printed { getPrinted :: a }
+newtype Printed a = Printed { getPrinted :: Doc }
 
-instance Pretty a => ToJSON (Printed a) where
-  toJSON = renderToJSON . pretty . getPrinted
+printed :: Pretty a => a -> Printed a
+printed = Printed . pretty
 
-instance Pretty a => Show (Printed a) where
-  show = render . pretty . getPrinted
+instance ToJSON (Printed a) where
+  toJSON = renderToJSON . getPrinted
+
+-- | Deserialise this printed value. This does not round-trip smoothly, and is
+-- intended for testing.
+instance FromJSON (Printed a) where
+  parseJSON _ = pure (Printed "<erased>")
+
+instance Show (Printed a) where
+  show = render . getPrinted

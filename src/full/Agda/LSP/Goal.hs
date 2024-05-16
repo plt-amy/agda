@@ -1,6 +1,9 @@
 {-# LANGUAGE DataKinds, DisambiguateRecordFields #-}
 module Agda.LSP.Goal where
 
+import qualified Data.Text as Text
+import Data.Foldable
+
 import qualified Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Types
 
@@ -46,6 +49,7 @@ data Goal = Goal
   deriving (Show, Generic)
 
 instance ToJSON Goal
+instance FromJSON Goal
 
 data ReifiedName = ReifiedName
   { reifiedNameActual :: C.Name
@@ -84,16 +88,29 @@ data Local = Local
 instance ToJSON Relevance where
   toJSON = toJSON . show
 
+instance FromJSON Relevance where
+  parseJSON = withText "Relevance" \x -> maybe (fail "Not a valid relevance") pure $ find ((x ==) . Text.pack . show) [minBound..maxBound]
+
 instance ToJSON Quantity where
   toJSON = \case
     Quantity0{} -> "0"
     Quantity1{} -> "1"
     Quantityω{} -> "ω"
 
+instance FromJSON Quantity where
+  parseJSON (String "0") = pure $ Quantity0 Q0Inferred
+  parseJSON (String "1") = pure $ Quantity1 Q1Inferred
+  parseJSON (String "ω") = pure $ Quantityω QωInferred
+  parseJSON _ = fail "Invalid Quantity"
+
+instance FromJSON Cohesion where
+  parseJSON = withText "Cohesion" \x -> maybe (fail "Not a valid cohesion") pure $ find ((x ==) . Text.pack . show) [minBound..maxBound]
+
 instance ToJSON Cohesion where
   toJSON = toJSON . show
 
 instance ToJSON Modality
+instance FromJSON Modality
 
 instance ToJSON Hiding where
   toJSON = \case
@@ -101,7 +118,15 @@ instance ToJSON Hiding where
     Instance{}  -> "Instance"
     NotHidden{} -> "NotHidden"
 
+
+instance FromJSON Hiding where
+  parseJSON (String "Hidden")    = pure Hidden
+  parseJSON (String "Instance")  = pure $ Instance NoOverlap
+  parseJSON (String "NotHidden") = pure NotHidden
+  parseJSON _ = fail "Invalid Hiding value"
+
 instance ToJSON Local
+instance FromJSON Local
 
 data GoalInfo = GoalInfo
   { goalGoal     :: Goal
@@ -111,6 +136,7 @@ data GoalInfo = GoalInfo
   deriving (Show, Generic)
 
 instance ToJSON GoalInfo
+instance FromJSON GoalInfo
 
 instance FromJSON SomeQuery where
   parseJSON = withObject "Query" \obj -> do
