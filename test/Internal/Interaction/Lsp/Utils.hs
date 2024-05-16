@@ -10,6 +10,7 @@ import System.IO.Temp
 import Control.Monad.IO.Class
 import Control.Monad
 import Control.Exception
+import Control.Applicative
 
 import qualified Data.Text as Text
 import Data.Foldable
@@ -22,7 +23,7 @@ import GHC.TypeLits (symbolVal)
 import Language.LSP.Protocol.Message
 import Language.LSP.Protocol.Types
 import Language.LSP.Protocol.Lens
-import Language.LSP.Test
+import Language.LSP.Test as LspT
 
 
 import qualified Agda.Syntax.Concrete as C
@@ -78,9 +79,15 @@ runAgdaSession caps path session = withSystemTempDirectory (takeBaseName path) \
 
 -- | Wait for an Agda file to be reloaded.
 waitForReload :: Session [Diagnostic]
-waitForReload = do
-  noDiagnostics
-  waitForDiagnostics
+waitForReload = worker [] where
+  worker :: [Diagnostic] -> Session [Diagnostic]
+  worker diag = do
+    msg <- anyMessage
+    case msg of
+      FromServerMess SMethod_TextDocumentPublishDiagnostics req -> worker (req ^. params . diagnostics)
+      -- If we receive a agda/goals, then TCing has finished.
+      FromServerMess (SMethod_CustomMethod ty) _ | symbolVal ty == "agda/goals" -> pure diag
+      _ -> worker diag
 
 -- | Wait for an Agda file to be reloaded, and assert that it reported no errors.
 waitForSuccessfulReload :: Session ()
@@ -124,18 +131,18 @@ getAbsSemanticTokens doc = do
     InR _ -> []
 
 -- | Query the agda server
-goalQuery :: (HasCallStack, ToJSON a) => TextDocumentIdentifier -> Query a -> Session a
+goalQuery :: (HasCallStack, ToJSON a, FromJSON a) => TextDocumentIdentifier -> Query a -> Session a
 goalQuery doc query = do
   let fullQuery = SomeQuery (doc ^. uri) query
   res <- request (SMethod_CustomMethod (Proxy :: Proxy "agda/query")) (toJSON fullQuery)
   case res ^. result of
     Left e -> Prelude.error (show e)
-    Right x -> case query of
-      Query_AllGoals{} -> parse x
-      Query_GoalAt{} -> parse x
-      Query_GoalInfo{} -> parse x
+    Right x -> parse x
 
   where
     parse x = case fromJSON x of
       Success x -> pure x
       Error e -> Prelude.error e
+
+skipManyTill :: Alternative m => m a -> m end -> m end
+skipManyTill p end = go where go = end <|> (p *> go)

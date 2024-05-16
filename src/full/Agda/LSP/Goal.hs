@@ -40,7 +40,7 @@ deriving newtype instance FromJSON InteractionId
 deriving newtype instance ToJSON InteractionId
 
 data SomeQuery where
-  SomeQuery :: forall a. ToJSON a => Lsp.Uri -> Query a -> SomeQuery
+  SomeQuery :: forall a. (FromJSON a, ToJSON a) => Lsp.Uri -> Query a -> SomeQuery
 
 deriving instance Show SomeQuery
 

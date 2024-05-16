@@ -26,14 +26,14 @@ giveAddsParentheses = testCase "Give adds parentheses" $ runAgdaSession def lspR
 
   insertText doc (Position 7 23) "add {!!} {!!} "
 
-  [Goal {goalRange = Range (Position 7 20) (Position 7 39)}] <- goalQuery doc Query_AllGoals
+  [Goal {goalRange = Range (Position 7 20) (Position 7 39)}] <- goalQuery doc $ Query_AllGoals False
   res <- executeCommand (toCommand "Give" (Command_Give uriDoc (Position 7 20)))
 
   newContents <- getDocumentEdit doc
   liftIO $ Text.lines newContents !! 7 @?= "add (suc x) y = suc (add {!!} {!!})"
 
   ( [ Goal {goalRange = Range (Position 7 25) (Position 7 29)}
-    , Goal {goalRange = Range (Position 7 30) (Position 7 34)} ] ) <- goalQuery doc Query_AllGoals
+    , Goal {goalRange = Range (Position 7 30) (Position 7 34)} ] ) <- goalQuery doc $ Query_AllGoals False
 
   pure ()
 
@@ -45,14 +45,14 @@ giveReplacesHoles = testCase "Give replaces holes" $ runAgdaSession def lspRoot 
 
   insertText doc (Position 7 23) "add ? (suc ?) "
 
-  [Goal {goalRange = Range (Position 7 20) (Position 7 39)}] <- goalQuery doc Query_AllGoals
+  [Goal {goalRange = Range (Position 7 20) (Position 7 39)}] <- goalQuery doc $ Query_AllGoals False
   res <- executeCommand (toCommand "Give" (Command_Give uriDoc (Position 7 20)))
 
   newContents <- getDocumentEdit doc
   liftIO $ Text.lines newContents !! 7 @?= "add (suc x) y = suc (add {!!} (suc {!!}))"
 
   ( [ Goal {goalRange = Range (Position 7 25) (Position 7 29)}
-    , Goal {goalRange = Range (Position 7 35) (Position 7 39)} ] ) <- goalQuery doc Query_AllGoals
+    , Goal {goalRange = Range (Position 7 35) (Position 7 39)} ] ) <- goalQuery doc $ Query_AllGoals False
 
   tokens <- getAbsSemanticTokens doc
   let
