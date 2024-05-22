@@ -15,15 +15,15 @@ import Language.LSP.Server
 import Agda.LSP.Monad.Base
 
 -- | Send a basic workspace edit request to the client.
-sendWorkspaceEdit :: MonadLsp a m => Text.Text -> Map.Map Uri [TextEdit] -> m ()
-sendWorkspaceEdit title changes =
+sendWorkspaceEdit :: MonadLsp a m => Text.Text -> Map.Map Uri [TextEdit] -> (Either ResponseError ApplyWorkspaceEditResult -> m ()) -> m ()
+sendWorkspaceEdit title changes wait =
   let
     edit = ApplyWorkspaceEditParams (Just title) $ WorkspaceEdit
       { _changes = Just changes
       , _documentChanges = Nothing
       , _changeAnnotations = Nothing
       }
-  in void $ sendRequest SMethod_WorkspaceApplyEdit edit (const (pure ()))
+  in void $ sendRequest SMethod_WorkspaceApplyEdit edit wait
 
 -- | Show a message on the client side.
 showWorkspaceMessage :: MonadLsp a m => MessageType -> Text.Text -> m ()

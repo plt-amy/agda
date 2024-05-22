@@ -24,11 +24,12 @@ import GHC.TypeLits
 
 data CommandArgs
   -- | Run Mimer on the interaction point at the given range.
-  = Command_Auto Uri Position
-  | Command_Give Uri Position
-  | Command_Refine Uri Position
+  = Command_Auto             Uri Position
+  | Command_Give             Uri Position
+  | Command_Refine           Uri Position
   | Command_ElaborateAndGive Uri Position
-  | Command_Intro Uri Position
+  | Command_Intro            Uri Position
+  | Command_Case             Uri Position
   -- | Reload the given file.
   | Command_Reload Uri
   deriving (Generic)

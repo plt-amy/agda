@@ -226,5 +226,7 @@ withPosition pos cont = do
     Just (iid, ip, _) -> Just <$> withInteractionId iid (cont ip)
     Nothing -> pure Nothing
 
-detachTask :: Task a -> Task ()
-detachTask k = withRunInIO \run -> void . forkIO $ run (void k)
+runLater :: Task () -> Task ()
+runLater cont = do
+  queue <- Task (asks workerTasks)
+  liftIO $ writeChan queue cont

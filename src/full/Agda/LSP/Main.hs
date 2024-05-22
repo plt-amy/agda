@@ -54,13 +54,15 @@ import System.IO
 import qualified Text.PrettyPrint.Annotated.HughesPJ as Ppr
 import qualified Text.PrettyPrint.Annotated as Ppr
 
+import qualified Agda.Interaction.InteractionTop as ITop
+
 import qualified Agda.Syntax.Concrete as C
 import qualified Agda.Syntax.Abstract as A
 import qualified Agda.Syntax.Position as Agda
 
 import Agda.Syntax.Translation.InternalToAbstract (Reify(reify), reifyUnblocked)
 import Agda.Syntax.Translation.AbstractToConcrete
-import Agda.Syntax.Abstract.Pretty
+import Agda.Syntax.Abstract.Pretty hiding (prettyA)
 import Agda.Syntax.Concrete.Pretty () -- Instances only
 import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Syntax.Common (isInstance)
@@ -126,6 +128,7 @@ import qualified Agda.LSP.Goal as Goal
 import Agda.TypeChecking.Pretty.Warning (getAllWarnings, getAllWarningsPreserving)
 import Agda.TypeChecking.Warnings (WhichWarnings(AllWarnings))
 import Agda.Interaction.Options.Warnings (unsolvedWarnings)
+import Agda.Interaction.MakeCase (makeCase)
 
 syncOptions :: TextDocumentSyncOptions
 syncOptions = TextDocumentSyncOptions
@@ -215,7 +218,10 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
 
             let
               report :: TCErr -> TCM ()
-              report terr = runT $ diagnoseTCM =<< toDiagnostic terr
+              report terr = do
+                it <- prettyTCM terr
+                liftIO . run . lspDebug $ show it
+                runT $ diagnoseTCM =<< toDiagnostic terr
 
               runT :: Task () -> TCM ()
               runT w = do
@@ -336,7 +342,7 @@ resetTCState = do
         I.setCommandLineOptions' absPath opts
 
 refreshClientInfo :: Task ()
-refreshClientInfo = detachTask do
+refreshClientInfo = do
   void $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
   sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/infoview/refresh")) . toJSON =<< theURI
 
@@ -390,7 +396,7 @@ requestHandlerTCM method uri cont = requestHandler method \req res -> withRunInI
 
 provideSemanticTokens :: Handlers WorkerM
 provideSemanticTokens =
-  requestHandlerTCM SMethod_TextDocumentSemanticTokensFull (view (params . textDocument . uri)) \req res -> detachTask do
+  requestHandlerTCM SMethod_TextDocumentSemanticTokensFull (view (params . textDocument . uri)) \req res -> do
   info <- useTC stSyntaxInfo
 
   delta <- getDelta
@@ -744,7 +750,8 @@ getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params 
       [ InR $ makeCodeAction "Run proof search on this goal" "agda.auto" (Command_Auto fileUri (range ^. start)) ] ++
       [ InR $ makeCodeAction "Fill goal with current contents" "agda.give" (Command_Give fileUri (range ^. start)) | nonEmpty ] ++
       [ InR $ makeCodeAction "Refine goal" "agda.refine" (Command_Refine fileUri (range ^. start)) | nonEmpty ] ++
-      [ InR $ makeCodeAction "Introduce term" "agda.refine" (Command_Intro fileUri (range ^. start)) | not nonEmpty ]
+      [ InR $ makeCodeAction "Introduce term" "agda.refine" (Command_Intro fileUri (range ^. start)) | not nonEmpty ] ++
+      [ InR $ makeCodeAction "Case split" "agda.case" (Command_Case fileUri (range ^. start)) ]
     _ -> InL []
 
   where
@@ -804,7 +811,7 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res -> 
       result <- Mimer.mimer AsIs ii inner (Text.unpack contents)
       case result of
         Mimer.MimerNoResult -> showWorkspaceMessage MessageType_Error "No solution found"
-        MimerExpr str -> sendWorkspaceEdit "Proof Search" (Map.singleton uri [TextEdit range (Text.pack str)])
+        MimerExpr str -> sendWorkspaceEdit "Proof Search" (Map.singleton uri [TextEdit range (Text.pack str)]) (const (pure ()))
         MimerList sols -> showWorkspaceMessage MessageType_Info . Text.pack $
             "Multiple solutions:" ++
             intercalate "\n" ["  " ++ show i ++ ". " ++ s | (i, s) <- sols]
@@ -821,6 +828,62 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res -> 
         [] -> showWorkspaceMessage MessageType_Error "No introduction forms found." >> pure (Right (InR Lsp.Null))
         [s] -> runGive "Introduce" B.refine ipi (range, offset, Text.pack s)
         _:_:_ -> showWorkspaceMessage MessageType_Error "Multiple introduction forms found." >> pure (Right (InR Lsp.Null))
+
+    Aeson.Success (Command_Case uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, _) (range, _, contents) -> do
+      (f, casectxt, cs) <- liftTCM $ makeCase ii range (Text.unpack contents)
+
+      withInteractionId ii do
+        tel <- liftTCM $ lookupSection (qnameModule f) -- don't shadow the names in this telescope
+        unicode <- getsTC $ optUseUnicode . getPragmaOptions
+
+        let
+          ipc = case ipClause ip of
+            IPClause{ipcClause = cls} -> cls
+
+            -- The interaction point will be in an IPClause because
+            -- otherwise the case split tactic fails
+            _ -> __IMPOSSIBLE__
+
+          clr = getRange ipc
+
+          -- Indentation prefix that aligns the clauses.
+          indent = case rStart clr of
+            Just pos -> replicate (fromIntegral (posCol pos - 1)) ' '
+            Nothing  -> __IMPOSSIBLE__
+
+        pcs <- liftTCM $ inTopContext $ addContext tel $ mapM prettyA cs
+
+        let
+          -- This is the same ugly hack for printing as in
+          -- InteractionTop, so use that same code.
+          (c0:cs0) = map (ITop.extlam_dropName unicode casectxt . ITop.decorate) pcs
+
+          -- Note that, since we're just telling the editor to replace
+          -- the entire clause by some new text, we have to align the
+          -- later clauses ourselves.
+          pcs'     = c0:map (indent ++) cs0
+
+        -- We also have to replace question marks with interaction points.
+        (replacement, _) <- liftIO $ rewriteHoles (Text.stripEnd (Text.pack (unlines pcs')))
+
+        delta <- getPositionInfo
+
+        case toUpdatedPosition (posInfoDelta delta) clr of
+          Just pos -> do
+            let edit = TextEdit pos replacement
+
+            sendWorkspaceEdit "Case split" (Map.singleton uri [edit]) \case
+              Left e  -> pure ()
+              Right{} ->
+                -- We have to reload after any pending events have been
+                -- processed; trying to do it in the event handler
+                -- causes pain.
+                runLater reloadURI
+
+            pure (Right (InR Lsp.Null))
+
+          Nothing -> pure (Left (ResponseError (InL LSPErrorCodes_RequestFailed) "The clause to which this interaction point belongs does not have a range. Try reloading?" Nothing))
+
     Aeson.Success (Command_Reload uri) -> runAtURI uri reloadURI
 
   where
@@ -926,7 +989,7 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res -> 
 
         pure (TextEdit range replacement, offset')
 
-      sendWorkspaceEdit name (Map.singleton uri [edit])
+      sendWorkspaceEdit name (Map.singleton uri [edit]) (const (pure ()))
 
       let fileLines = Rope.toTextLines fileContents'
       setSnapshot . Just $ StateSnapshot
@@ -971,8 +1034,8 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res -> 
     rewriteHoleWorker txt (T.TokSymbol T.SymQuestionMark ival:ts) p o
       | start <- posOffset (iStart ival), end <- posOffset (iEnd ival)
       , start + 1 == end =
-        let (txts, ips, map) = rewriteHoleWorker txt ts end (o + 3)
-        in (substring p start txt:"{!!}":txts, ips, Map.insert end (o + 3) map)
+        let (txts, ips, map) = rewriteHoleWorker txt ts end (o + 4)
+        in (substring p start txt:"{! !}":txts, ips, Map.insert end (o + 4) map)
     rewriteHoleWorker txt (t:ts) p o = rewriteHoleWorker txt ts p o
 
     substring start end = Text.take (end - start) . Text.drop start
