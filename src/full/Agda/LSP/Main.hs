@@ -123,6 +123,9 @@ import Agda.LSP.Monad.Base
 import Agda.LSP.Commands
 import Agda.LSP.Output
 import qualified Agda.LSP.Goal as Goal
+import Agda.TypeChecking.Pretty.Warning (getAllWarnings, getAllWarningsPreserving)
+import Agda.TypeChecking.Warnings (WhichWarnings(AllWarnings))
+import Agda.Interaction.Options.Warnings (unsolvedWarnings)
 
 syncOptions :: TextDocumentSyncOptions
 syncOptions = TextDocumentSyncOptions
@@ -212,23 +215,17 @@ spawnOrGet uri = withRunInIO \run -> case uriToFilePath uri of
 
             let
               report :: TCErr -> TCM ()
-              report terr = do
-                diag <- runReaderT (unTask (toDiagnostic terr)) worker
-                liftIO . run $
-                  sendNotification SMethod_TextDocumentPublishDiagnostics $ PublishDiagnosticsParams
-                    { _uri         = uri
-                    , _version     = Nothing
-                    , _diagnostics = diag
-                    }
+              report terr = runT $ diagnoseTCM =<< toDiagnostic terr
 
-              task' = do
+              runT :: Task () -> TCM ()
+              runT w = do
                 setInteractionOutputCallback (lspOutputCallback uri (lspStateConfig state))
                 conf <- liftIO (run getConfig)
                 locallyTC eHighlightingLevel (const (lspHighlightingLevel conf)) do
-                  runReaderT (unTask task) worker `catchError` report
+                  runReaderT (unTask w) worker `catchError` report
 
             withMVar lock \state -> do
-              unTCM task' state initEnv
+              unTCM (runT task) state initEnv
                 `catch` \(e :: SomeException) -> run (lspDebug (show e))
 
           let
@@ -262,6 +259,8 @@ updateInteractionRanges text = do
   (parseResult, _) <- liftIO . Pa.runPMIO $ Pa.parseFile Pa.tokensParser (RangeFile (srcFilePath path) Nothing) (Text.unpack text)
   setInteractionPointRanges . mapMaybe (fmap toLsp . findInteractionPointToken) $ either (const []) (fst . fst) parseResult
 
+  refreshGoals
+
 findInteractionPointToken :: T.Token -> Maybe Interval
 findInteractionPointToken (T.TokSymbol T.SymQuestionMark ival) = Just ival
 findInteractionPointToken _ = Nothing
@@ -275,7 +274,8 @@ onTextDocumentOpen = notificationHandler SMethod_TextDocumentDidOpen \notif ->
 
 onTextDocumentSaved :: Handlers WorkerM
 onTextDocumentSaved = notificationHandler SMethod_TextDocumentDidSave \notif ->
-  runAtURI (notif ^. params . textDocument . uri) reloadURI
+  whenM (lspReloadOnSave <$> getConfig) $
+    runAtURI (notif ^. params . textDocument . uri) reloadURI
 
 onTextDocumentChange :: Handlers WorkerM
 onTextDocumentChange = notificationHandler SMethod_TextDocumentDidChange \notif ->
@@ -310,6 +310,7 @@ onTextDocumentClosed = notificationHandler SMethod_TextDocumentDidClose \notif -
 diagnoseTCM :: [Diagnostic] -> Task ()
 diagnoseTCM diag = do
   uri <- theURI
+
   sendNotification SMethod_TextDocumentPublishDiagnostics $ PublishDiagnosticsParams
     { _uri         = uri
     , _version     = Nothing
@@ -339,13 +340,15 @@ refreshClientInfo = detachTask do
   void $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
   sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/infoview/refresh")) . toJSON =<< theURI
 
-  WarningsAndNonFatalErrors warn err <- liftTCM $ getWarningsAndNonFatalErrors
+  diagnoseTCM =<< fold
+    [ toDiagnostic =<< liftTCM (getAllWarnings AllWarnings)
+    , toDiagnostic =<< getUnsolvedMetaVars
+    ]
 
-  when (not (null warn) || not (null err)) do
-    warn <- foldMap toDiagnostic warn
-    err <- foldMap toDiagnostic err
-    diagnoseTCM (warn ++ err)
+  refreshGoals
 
+refreshGoals :: Task ()
+refreshGoals = do
   goals <- fillQuery (Query_AllGoals False)
   uri <- theURI
   sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/goals")) $ Object $ KeyMap.fromList
@@ -785,13 +788,14 @@ removeHighlightingFor :: (Agda.HasRange a, MonadTCState m) => a -> m ()
 removeHighlightingFor x = modifyTCLens' stSyntaxInfo \map -> snd (insideAndOutside (rangeToRange (getRange x)) map)
 
 executeAgdaCommand :: Handlers WorkerM
-executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
+executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res -> do
+  lspDebug $ show (req ^. params)
   case parseCommand (req ^. params) of
     Aeson.Error e -> res (Left (ResponseError (InL LSPErrorCodes_RequestFailed) (Text.pack e) Nothing))
     Aeson.Success (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, _, contents) -> do
       -- TODO: What's the proper range here? This gets passed from the elisp side, so
       -- I think it's the *inside* of the interaction point, after edits have been applied.
-      result <- Mimer.mimer ii inner (Text.unpack contents)
+      result <- Mimer.mimer AsIs ii inner (Text.unpack contents)
       case result of
         Mimer.MimerNoResult -> showWorkspaceMessage MessageType_Error "No solution found"
         MimerExpr str -> sendWorkspaceEdit "Proof Search" (Map.singleton uri [TextEdit range (Text.pack str)])
@@ -811,6 +815,7 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
         [] -> showWorkspaceMessage MessageType_Error "No introduction forms found." >> pure (Right (InR Lsp.Null))
         [s] -> runGive "Introduce" B.refine ipi (range, offset, Text.pack s)
         _:_:_ -> showWorkspaceMessage MessageType_Error "Multiple introduction forms found." >> pure (Right (InR Lsp.Null))
+    Aeson.Success (Command_Reload uri) -> runAtURI uri reloadURI
 
   where
     applyEditNow range replacement contents
@@ -852,12 +857,14 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res ->
 
         updatePoints _ [] = []
         updatePoints rs ((ii, ip):xs)
-          -- If we're a new interaction point, use the range from the source code
+          -- If we're a new interaction point, use the range from the source code.
           | not (BiMap.source ii oldInteractionPoints)
           = let (r, rs') = uncons rs in (ii, ip { ipRange = r }):updatePoints rs' xs
-          -- If we're an existing point, attempt to remap the position
-          | Just pos <- getCurrentInteractionRange posInfo { posInfoDelta = newDelta } ip
+
+          -- If we're an existing point, update the range according to the delta.
+          | Just pos <- toUpdatedPosition newDelta (ipRange ip)
           = (ii, ip { ipRange = toAgdaRange newContents (rangeFile (ipRange ip)) pos }):updatePoints rs xs
+
           -- Otherwise ignore.
           | otherwise = (ii, ip):updatePoints rs xs
 

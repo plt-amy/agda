@@ -7,7 +7,7 @@ import Control.Concurrent.MVar
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
 import Control.Monad.Except
-import Control.Applicative (liftA2, (<|>))
+import Control.Applicative (liftA2, asum)
 import Control.Concurrent
 import Control.Monad
 
@@ -23,6 +23,7 @@ import Data.IORef
 
 import GHC.Generics
 
+import qualified Language.LSP.Protocol.Message as Lsp
 import qualified Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Types (NormalizedUri, Uri, fromNormalizedUri)
 import Language.LSP.Protocol.Lens (start, end)
@@ -33,6 +34,7 @@ import Agda.Syntax.Position
 import Agda.Syntax.Common
 
 import Agda.TypeChecking.Monad
+import Agda.TypeChecking.Pretty
 
 import qualified Agda.Utils.BiMap as BiMap
 
@@ -48,16 +50,24 @@ import Agda.Utils.Maybe (fromMaybe, mapMaybe)
 import Agda.Utils.Lens
 
 data LspConfig = LspConfig
-  { lspHighlightingLevel :: HighlightingLevel
+  { lspReloadOnSave      :: Bool
+  , lspHighlightingLevel :: HighlightingLevel
   }
   deriving (Show, Generic)
 
 instance FromJSON HighlightingLevel
-instance FromJSON LspConfig
+instance FromJSON LspConfig where
+  parseJSON = withObject "LspConfig" \x -> do
+    lsp <- x .: "lsp"
+    flip (withObject "lsp") lsp \lsp ->
+      LspConfig
+        <$> lsp .: "reloadOnSave"
+        <*> lsp .: "highlightingLevel"
 
 initLspConfig :: LspConfig
 initLspConfig = LspConfig
   { lspHighlightingLevel = NonInteractive
+  , lspReloadOnSave      = True
   }
 
 data PositionInfo = PositionInfo
@@ -74,6 +84,8 @@ data Worker = Worker
 
   , workerLoadedState :: !(MVar (IORef TCState))
     -- ^ Mutable variable for the “main” TC state in this worker.
+  , workerPosInfo     :: !(MVar PositionInfo)
+  , workerSnapshot    :: !(MVar (Maybe StateSnapshot))
 
   , workerThread      :: ThreadId
     -- ^ Thread for this worker.
@@ -83,9 +95,6 @@ data Worker = Worker
   , workerContext     :: LanguageContextEnv LspConfig
 
   , workerOptions     :: CommandLineOptions
-
-  , workerPosInfo     :: !(MVar PositionInfo)
-  , workerSnapshot    :: !(MVar (Maybe StateSnapshot))
   }
 
 -- | A snapshot of the current editing state.
@@ -177,15 +186,19 @@ setSnapshot snapshot = do
 getCurrentInteractionRange :: PositionInfo -> InteractionPoint -> Maybe Lsp.Range
 getCurrentInteractionRange posInfo ip = do
   ival <- rangeToInterval (ipRange ip)
+
   let
     delta = posInfoDelta posInfo
     s = toUpdatedPosition delta (iStart ival)
     e = toUpdatedPosition delta (iEnd ival)
-  pointAt s <|> pointAt e
+
+  asum
+    [ pointAt (view start) =<< s
+    , pointAt (view end) =<< e
+    ]
 
   where
-    pointAt Nothing = Nothing
-    pointAt (Just x) = find ((== x) . view end) (posInfoInteractions posInfo)
+    pointAt f x = find ((== x) . f) (posInfoInteractions posInfo)
 
 type InteractionPointInfo = (InteractionId, InteractionPoint, Lsp.Range)
 

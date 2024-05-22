@@ -29,6 +29,8 @@ data CommandArgs
   | Command_Refine Uri Position
   | Command_ElaborateAndGive Uri Position
   | Command_Intro Uri Position
+  -- | Reload the given file.
+  | Command_Reload Uri
   deriving (Generic)
 
 -- | Encode/decode a list of arguments to a list of JSON values.
@@ -104,4 +106,4 @@ toCommand t = gToCommand t . from
 
 -- | Parse a command from a set of command parameters.
 parseCommand :: ExecuteCommandParams -> Result CommandArgs
-parseCommand = maybe (Error "No such command") (fmap to) . gParseCommand
+parseCommand cmd = maybe (Error ("No such command: " <> show (toJSON cmd))) (fmap to) (gParseCommand cmd)

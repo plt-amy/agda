@@ -7,6 +7,7 @@ import qualified Data.Text as Text
 import qualified Data.Set as Set
 import Data.Traversable
 
+import qualified Agda.Syntax.Concrete.Pretty ()
 import qualified Agda.Syntax.Common.Pretty as Ppr
 import Agda.Syntax.Concrete.Definitions (notSoNiceDeclarations)
 import Agda.Syntax.Abstract.Name
@@ -22,9 +23,17 @@ import Agda.LSP.Position
 
 import Agda.Utils.Maybe (fromMaybe, isNothing, caseMaybe)
 import Agda.Utils.Lens
+import Agda.Interaction.BasicOps (typeOfMetaMI)
+import Agda.Interaction.Base (Rewrite(AsIs))
+import Agda.Syntax.Translation.AbstractToConcrete (abstractToConcrete_)
 
 class ToDiagnostic a where
   toDiagnostic :: a -> Task [Lsp.Diagnostic]
+
+  default toDiagnostic :: forall f b. (Foldable f, a ~ f b, ToDiagnostic b) => a -> Task [Lsp.Diagnostic]
+  toDiagnostic = foldMap toDiagnostic
+
+instance ToDiagnostic a => ToDiagnostic [a] where
 
 diagnostic :: HasRange x => Lsp.DiagnosticSeverity -> x -> Task Doc -> Task [Lsp.Diagnostic]
 diagnostic sev rng doc | NoRange <- getRange rng = pure []
@@ -73,11 +82,12 @@ seeAlso rng doc diag = do
     Nothing -> pure diag
 
 instance ToDiagnostic TCWarning where
+  toDiagnostic :: TCWarning -> Task [Lsp.Diagnostic]
   toDiagnostic warn = case tcWarning warn of
     TerminationIssue err -> error' warn (prettyTCM warn)
     NicifierIssue warn -> warning warn (pretty warn)
 
-    InteractionMetaBoundaries mvs -> flip foldMap (Set.fromList mvs) \rng ->
+    InteractionMetaBoundaries mvs -> flip foldMap mvs \rng ->
       info rng "This interaction point has unsolved boundary constraints."
 
     w -> warning warn (prettyWarning w)
@@ -103,3 +113,8 @@ instance ToDiagnostic TCErr where
       foldMap toDiagnostic ws
     TypeError loc s e -> withTCState (const s) $ toDiagnostic e
     err -> error' err (prettyTCM err)
+
+instance ToDiagnostic MetaVariable where
+  toDiagnostic mv = withMetaInfo' mv do
+    judg <- abstractToConcrete_ =<< liftTCM (typeOfMetaMI AsIs (jMetaId (mvJudgement mv)))
+    warning mv ("Unsolved metavariable:" $$ nest 2 (pretty judg))
