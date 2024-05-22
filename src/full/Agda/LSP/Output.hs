@@ -1,7 +1,7 @@
 {-# LANGUAGE RoleAnnotations #-}
 module Agda.LSP.Output
   ( Printed
-  , printed
+  , printed, printedTCM
   , renderToJSON
   )
   where
@@ -18,6 +18,8 @@ import qualified Text.PrettyPrint.Annotated as Ppr
 import Agda.Interaction.Highlighting.Common (toAtoms)
 import Agda.Syntax.Common.Pretty
 import Agda.Syntax.Common.Aspect ( Aspects (aspect) )
+
+import Agda.TypeChecking.Pretty (PrettyTCM(..), MonadPretty)
 
 import Agda.Utils.Impossible (__IMPOSSIBLE__)
 
@@ -60,6 +62,9 @@ type role Printed nominal
 
 printed :: Pretty a => a -> Printed a
 printed = Printed . pretty
+
+printedTCM :: (MonadPretty m, PrettyTCM a) => a -> m (Printed a)
+printedTCM = fmap Printed . prettyTCM
 
 instance ToJSON (Printed a) where
   toJSON = renderToJSON . getPrinted

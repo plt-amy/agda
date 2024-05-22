@@ -92,7 +92,7 @@ import Agda.Interaction.Highlighting.Common (toAtoms)
 import Agda.Interaction.InteractionTop (highlightExpr)
 import Agda.Interaction.Highlighting.Range (rangeToRange)
 import Agda.Interaction.Highlighting.Generate (generateTokenInfoFromString)
-import Agda.Interaction.Base (Rewrite(AsIs), UseForce (WithoutForce))
+import Agda.Interaction.Base (Rewrite(AsIs, Simplified), UseForce (WithoutForce))
 import Agda.Interaction.Response.Base
 import Agda.Interaction.FindFile (SourceFile(..))
 import Agda.Interaction.BasicOps (getWarningsAndNonFatalErrors, normalForm)
@@ -340,17 +340,18 @@ refreshClientInfo = detachTask do
   void $ sendRequest SMethod_WorkspaceSemanticTokensRefresh Nothing (const (pure ()))
   sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/infoview/refresh")) . toJSON =<< theURI
 
+  refreshGoals
+
+refreshGoals :: Task ()
+refreshGoals = do
   diagnoseTCM =<< fold
     [ toDiagnostic =<< liftTCM (getAllWarnings AllWarnings)
     , toDiagnostic =<< getUnsolvedMetaVars
     ]
 
-  refreshGoals
-
-refreshGoals :: Task ()
-refreshGoals = do
   goals <- fillQuery (Query_AllGoals False)
   uri <- theURI
+
   sendNotification (SMethod_CustomMethod (Proxy :: Proxy "agda/goals")) $ Object $ KeyMap.fromList
     [ ("goals", toJSON goals)
     , ("uri",   toJSON uri)
@@ -517,7 +518,6 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
         , localModality    = getModality (domInfo dom)
         }
 
-
   gty <- fmap printed . liftTCM . printedTerm AsIs . unEl =<< getMetaTypeInContext mi
 
   ctx <- getContext
@@ -527,7 +527,9 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
   lets <- Map.toAscList <$> asksTC envLetBindings
   lets <- catMaybes <$> for lets mkLet
 
-  boundary <- liftTCM $ B.getIPBoundary AsIs iid
+  boundary <- liftTCM $ B.getIPBoundary Simplified iid
+
+  constr <- traverse printedTCM =<< liftTCM (B.getConstraintsMentioning Simplified $ fromMaybe __IMPOSSIBLE__ (ipMeta ip))
 
   pure GoalInfo
     { goalGoal     = Goal iid (fromMaybe (toLsp (ipRange ip)) (getCurrentInteractionRange posInfo ip)) (Just gty)
@@ -535,6 +537,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
     , goalBoundary = case boundary of
         [] -> Nothing
         xs -> Just $! map printed xs
+    , goalConstraints = constr
     }
 
 goal :: Handlers WorkerM
@@ -610,16 +613,19 @@ definedCompletionItem qnm = getConstInfo qnm >>= \def -> runMaybeT do
     & kind         .~ defKind
 
 completion :: Handlers WorkerM
-completion = requestHandlerTCM SMethod_TextDocumentCompletion (view (params . textDocument . uri)) \req res ->
-  withPosition (req ^. params . position) \ip -> do
-    ctx  <- getContext
-    comp <- traverse (uncurry localCompletionItem) (zip [0..] ctx)
+completion = requestHandlerTCM SMethod_TextDocumentCompletion (view (params . textDocument . uri)) \req res -> do
+  ip <- findInteractionPoint (req ^. params . position)
+  case ip of
+    Just (ii, ip, _) -> withInteractionId ii do
+      ctx  <- getContext
+      comp <- traverse (uncurry localCompletionItem) (zip [0..] ctx)
 
-    want  <- traverse getMetaTypeInContext (ipMeta ip)
-    comp' <- traverse definedCompletionItem . Set.toList =<< fmap (^. scopeInScope) getScope
+      want  <- traverse getMetaTypeInContext (ipMeta ip)
+      comp' <- traverse definedCompletionItem . Set.toList =<< fmap (^. scopeInScope) getScope
 
-    reportSLn "lsp.completion" 10 $ show req
-    res (Right (InL (catMaybes comp ++ catMaybes comp')))
+      reportSLn "lsp.completion" 10 $ show req
+      res (Right (InL (catMaybes comp ++ catMaybes comp')))
+    Nothing -> res $ Right (InR (InR Lsp.Null))
 
 onTypeFormatting :: Handlers WorkerM
 onTypeFormatting = requestHandler SMethod_TextDocumentOnTypeFormatting \req res -> do

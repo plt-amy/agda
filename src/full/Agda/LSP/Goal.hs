@@ -28,6 +28,7 @@ import Agda.Interaction.JSON
 
 import Agda.LSP.Monad.Base
 import Agda.LSP.Output
+import Agda.Interaction.Output (OutputConstraint, OutputForm)
 
 data Query a where
   Query_GoalAt     :: Lsp.Position  -> Query (Maybe InteractionId)
@@ -147,9 +148,10 @@ instance ToJSON Local
 instance FromJSON Local
 
 data GoalInfo = GoalInfo
-  { goalGoal     :: Goal
-  , goalContext  :: [Local]
-  , goalBoundary :: Maybe [Printed (IPFace' C.Expr)]
+  { goalGoal        :: Goal
+  , goalContext     :: [Local]
+  , goalBoundary    :: Maybe [Printed (IPFace' C.Expr)]
+  , goalConstraints :: [Printed (OutputForm C.Expr C.Expr)]
   }
   deriving (Show, Generic)
 
