@@ -2,7 +2,7 @@
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE NondecreasingIndentation #-}
-module Agda.LSP.Main (runAgdaLSP) where
+module Agda.LSP.Main (runAgdaLSP, serverDefinition) where
 
 import Control.Monad.Identity (runIdentity)
 import Control.Monad.Trans.Maybe
@@ -140,30 +140,33 @@ syncOptions = TextDocumentSyncOptions
   , _save              = Just (InR (SaveOptions (Just False)))
   }
 
+-- | Run the LSP server using stdin/stdout as input/output channels.
 runAgdaLSP :: TCM () -> TCM ()
-runAgdaLSP setup = do
-  liftIO do
-    hSetBuffering stdout NoBuffering
-    hSetBuffering stdin NoBuffering
-
-  exc <- liftIO $ runServer ServerDefinition
-    { defaultConfig    = def
-    , configSection    = "agda"
-    , parseConfig      = \_ -> mapLeft Text.pack . parseEither parseJSON
-    , onConfigChange   = const (pure ())
-    , doInitialize     = lspInit setup
-    , staticHandlers   = lspHandlers
-    , interpretHandler = \state -> Iso (flip runReaderT state . unWorkerM) liftIO
-    , options          = def
-      { optTextDocumentSync = Just syncOptions
-      , optDocumentOnTypeFormattingTriggerCharacters = Just ('?' :| [])
-      , optExecuteCommandCommands = Just commandNames
-      }
-    }
-
-  liftIO case exc of
+runAgdaLSP setup = liftIO do
+  exc <- runServer $ serverDefinition setup
+  case exc of
     0 -> exitSuccess
     n -> exitWith (ExitFailure n)
+
+-- | Create an LSP server.
+--
+-- The supplied TCM value may be used to set up the initial command line options
+-- of the TC state.
+serverDefinition :: TCM () -> ServerDefinition LspConfig
+serverDefinition setup = ServerDefinition
+  { defaultConfig    = def
+  , configSection    = "agda"
+  , parseConfig      = \_ -> mapLeft Text.pack . parseEither parseJSON
+  , onConfigChange   = const (pure ())
+  , doInitialize     = lspInit setup
+  , staticHandlers   = lspHandlers
+  , interpretHandler = \state -> Iso (flip runReaderT state . unWorkerM) liftIO
+  , options          = def
+    { optTextDocumentSync = Just syncOptions
+    , optDocumentOnTypeFormattingTriggerCharacters = Just ('?' :| [])
+    , optExecuteCommandCommands = Just commandNames
+    }
+  }
 
 lspOutputCallback :: Uri -> LanguageContextEnv LspConfig -> InteractionOutputCallback
 lspOutputCallback uri config = liftIO . runLspT config . \case
