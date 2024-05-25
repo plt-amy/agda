@@ -121,6 +121,7 @@ import Agda.Syntax.Parser.Tokens (Token(TokSymbol), Symbol (SymQuestionMark))
 import Agda.Syntax.Common (InteractionId, LensModality (getModality), LensHiding (getHiding), Relevance (Relevant), LensRelevance (getRelevance), inverseComposeRelevance, LensQuantity (getQuantity), moreQuantity)
 import Agda.Syntax.Fixity (Precedence(TopCtx))
 
+import Agda.LSP.Monad.Config
 import Agda.LSP.Monad.Base
 import Agda.LSP.Commands
 import Agda.LSP.Output
@@ -146,7 +147,7 @@ runAgdaLSP setup = do
     hSetBuffering stdin NoBuffering
 
   exc <- liftIO $ runServer ServerDefinition
-    { defaultConfig    = initLspConfig
+    { defaultConfig    = def
     , configSection    = "agda"
     , parseConfig      = \_ -> mapLeft Text.pack . parseEither parseJSON
     , onConfigChange   = const (pure ())

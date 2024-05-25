@@ -49,16 +49,16 @@ giveReplacesHoles = testCase "Give replaces holes" $ runAgdaSession def lspRoot 
   res <- executeCommand (toCommand "Give" (Command_Give uriDoc (Position 7 20)))
 
   newContents <- getDocumentEdit doc
-  liftIO $ Text.lines newContents !! 7 @?= "add (suc x) y = suc (add {!!} (suc {!!}))"
+  liftIO $ Text.lines newContents !! 7 @?= "add (suc x) y = suc (add {! !} (suc {! !}))"
 
-  ( [ Goal {goalRange = Range (Position 7 25) (Position 7 29)}
-    , Goal {goalRange = Range (Position 7 35) (Position 7 39)} ] ) <- goalQuery doc $ Query_AllGoals False
+  ( [ Goal {goalRange = Range (Position 7 25) (Position 7 30)}
+    , Goal {goalRange = Range (Position 7 36) (Position 7 41)} ] ) <- goalQuery doc $ Query_AllGoals False
 
   tokens <- getAbsSemanticTokens doc
   let
     token = SemanticTokenAbsolute
       { _line = 7
-      , _startChar = 31
+      , _startChar = 32
       , _length = 3
       , _tokenType = SemanticTokenTypes_EnumMember
       , _tokenModifiers = []

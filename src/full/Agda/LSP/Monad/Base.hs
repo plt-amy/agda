@@ -38,6 +38,7 @@ import Agda.TypeChecking.Pretty
 
 import qualified Agda.Utils.BiMap as BiMap
 
+import Agda.LSP.Monad.Config
 import Agda.LSP.Position
 import Agda.Interaction.FindFile (SourceFile(..))
 import Agda.Interaction.Options
@@ -49,26 +50,6 @@ import Agda.Utils.Functor
 import Agda.Utils.Maybe (fromMaybe, mapMaybe)
 import Agda.Utils.Lens
 
-data LspConfig = LspConfig
-  { lspReloadOnSave      :: Bool
-  , lspHighlightingLevel :: HighlightingLevel
-  }
-  deriving (Show, Generic)
-
-instance FromJSON HighlightingLevel
-instance FromJSON LspConfig where
-  parseJSON = withObject "LspConfig" \x -> do
-    lsp <- x .: "lsp"
-    flip (withObject "lsp") lsp \lsp ->
-      LspConfig
-        <$> lsp .: "reloadOnSave"
-        <*> lsp .: "highlightingLevel"
-
-initLspConfig :: LspConfig
-initLspConfig = LspConfig
-  { lspHighlightingLevel = NonInteractive
-  , lspReloadOnSave      = True
-  }
 
 data PositionInfo = PositionInfo
   { posInfoDelta        :: PosDelta
