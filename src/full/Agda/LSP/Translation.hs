@@ -46,15 +46,11 @@ instance ToLsp (Interval' a) where
 
 instance ToLsp (Range' a) where
   type LspType (Range' a) = Lsp.Range
-  toLsp = \case
-    NoRange -> Lsp.Range (Lsp.Position 0 0) (Lsp.Position 0 0) -- TODO
-
+  toLsp range = case rangeToIntervalWithFile range of 
+    Nothing -> Lsp.Range (Lsp.Position 0 0) (Lsp.Position 0 0) -- TODO
     -- TODO: Agda has non-contiguous ranges but LSP just wants a start
     -- and end position.
-    Range _ is ->
-      let
-        is' = toList is
-      in toLsp (Interval (iStart (head is')) (iEnd (last is')))
+    Just i -> toLsp (Interval (iStart i) (iEnd i))
 
 instance ToLsp Aspect where
   type LspType Aspect = Lsp.SemanticTokenTypes
