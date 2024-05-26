@@ -333,7 +333,14 @@ resetTCState = do
   _ <- takeSnapshot
 
   opts <- getInitialOptions
-  root <- getRootPath
+
+  rootPath <- getRootPath
+  workspaceFolders <- getWorkspaceFolders
+
+  let
+    root = rootPath <|> case workspaceFolders of
+      Just [x] -> uriToFilePath (x ^. uri)
+      _ -> Nothing
 
   liftTCM do
     resetState
