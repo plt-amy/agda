@@ -131,6 +131,8 @@ import Agda.TypeChecking.Warnings (WhichWarnings(AllWarnings))
 import Agda.Interaction.Options.Warnings (unsolvedWarnings)
 import Agda.Interaction.MakeCase (makeCase)
 
+import Agda.VersionCommit
+
 syncOptions :: TextDocumentSyncOptions
 syncOptions = TextDocumentSyncOptions
   { _openClose         = Just True
@@ -165,6 +167,7 @@ serverDefinition setup = ServerDefinition
     { optTextDocumentSync = Just syncOptions
     , optDocumentOnTypeFormattingTriggerCharacters = Just ('?' :| [])
     , optExecuteCommandCommands = Just commandNames
+    , optServerInfo = Just ServerInfo { _name = "Agda", _version = Just (Text.pack versionWithCommitInfo) }
     }
   }
 
