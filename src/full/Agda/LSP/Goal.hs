@@ -108,7 +108,10 @@ instance ToJSON Relevance where
   toJSON = toJSON . show
 
 instance FromJSON Relevance where
-  parseJSON = withText "Relevance" \x -> maybe (fail "Not a valid relevance") pure $ find ((x ==) . Text.pack . show) [minBound..maxBound]
+  parseJSON (String "relevant")         = pure $ Relevant ORelInferred
+  parseJSON (String "irrelevant")       = pure $ Irrelevant OIrrInferred
+  parseJSON (String "shape-irrelevant") = pure $ ShapeIrrelevant OShIrrInferred
+  parseJSON _ = fail "Invalid Relevance"
 
 instance ToJSON Quantity where
   toJSON = \case

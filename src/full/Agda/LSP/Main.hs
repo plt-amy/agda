@@ -13,7 +13,7 @@ import Control.Monad.Except (MonadError(catchError))
 import Control.Applicative
 import Control.Concurrent
 import Control.Exception
-import Control.Monad
+import Control.Monad hiding (when, guard)
 
 import qualified Data.Text.Utf16.Rope.Mixed as Rope
 import qualified Data.HashMap.Strict as HashMap
@@ -65,7 +65,7 @@ import Agda.Syntax.Translation.AbstractToConcrete
 import Agda.Syntax.Abstract.Pretty hiding (prettyA)
 import Agda.Syntax.Concrete.Pretty () -- Instances only
 import Agda.Syntax.Common.Pretty (prettyShow)
-import Agda.Syntax.Common (isInstance)
+import Agda.Syntax.Common (isInstance, isRelevant)
 import Agda.Syntax.Scope.Base
 import Agda.Syntax.Concrete (Module(modDecls))
 import Agda.Syntax.Position
@@ -365,7 +365,7 @@ refreshClientInfo = do
 refreshGoals :: Task ()
 refreshGoals = do
   diagnoseTCM =<< fold
-    [ toDiagnostic =<< liftTCM (getAllWarnings AllWarnings)
+    [ toDiagnostic . Set.toList =<< liftTCM (getAllWarnings AllWarnings)
     , toDiagnostic =<< getUnsolvedMetaVars
     ]
 
@@ -493,7 +493,7 @@ fillQuery (Query_GoalInfo iid) = withInteractionId iid do
           [ [ Goal.NotInScope | s /= C.InScope ]
           , [ Goal.Inaccessible r
             | let r = getRelevance mod `inverseComposeRelevance` getRelevance ai
-            , r /= Relevant ]
+            , not (isRelevant r) ]
           , [ Goal.Erased   | not (getQuantity ai `moreQuantity` getQuantity mod) ]
           , [ Goal.Instance | isInstance ai ]
           ]
@@ -1076,5 +1076,5 @@ lspHandlers caps = mconcat
   , executeAgdaCommand
   ]
 
-tryError :: MonadError e m => m a -> m (Either e a)
-tryError = (`catchError` pure . Left) . fmap Right
+-- tryError :: MonadError e m => m a -> m (Either e a)
+-- tryError = (`catchError` pure . Left) . fmap Right
