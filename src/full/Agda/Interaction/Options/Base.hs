@@ -1,13 +1,14 @@
 {-# LANGUAGE CPP       #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE PartialTypeSignatures #-}
-{-# OPTIONS_GHC -Wno-partial-type-signatures #-}
 
+{-# OPTIONS_GHC -Wno-partial-type-signatures #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 
 module Agda.Interaction.Options.Base
     ( CommandLineOptions(..)
     , PragmaOptions(..)
+    , OptionError
     , OptionWarning(..), optionWarningName
     , Flag, OptM, runOptM, OptDescr(..), ArgDescr(..)
     , Verbosity, VerboseKey, VerboseLevel
@@ -232,6 +233,7 @@ import Agda.Utils.Monad         ( tell1 )
 import Agda.Utils.Null
 import Agda.Utils.ProfileOptions
 import Agda.Utils.String        ( unwords1 )
+import qualified Agda.Utils.String       as String
 import Agda.Utils.Trie          ( Trie )
 import qualified Agda.Utils.Trie as Trie
 import Agda.Utils.TypeLits
@@ -373,10 +375,10 @@ data PragmaOptions = PragmaOptions
       --   optRequireUniqueMetaSolutions.
   , _optRequireUniqueMetaSolutions :: WithDefault 'True
       -- ^ Forbid non-unique meta solutions allowed. For instance from INJECTIVE_FOR_INFERENCE pragmas.
-  , _optPostfixProjections        :: WithDefault 'False
+  , _optPostfixProjections        :: WithDefault 'True
       -- ^ Should system generated projections 'ProjSystem' be printed
       --   postfix (True) or prefix (False).
-  , _optKeepPatternVariables      :: WithDefault 'False
+  , _optKeepPatternVariables      :: WithDefault 'True
       -- ^ Should case splitting replace variables with dot patterns
       --   (False) or keep them as variables (True).
   , _optInferAbsurdClauses        :: WithDefault 'True
@@ -1235,12 +1237,6 @@ infectiveCoinfectiveOptions =
   , infectiveOption optCohesion               "--cohesion"
   , infectiveOption optErasure                "--erasure"
   , infectiveOption optErasedMatches          "--erased-matches"
-  , infectiveOption (not . optUniverseCheck)  "--type-in-type"
-  , infectiveOption optOmegaInOmega           "--omega-in-omega"
-  , infectiveOption optInjectiveTypeConstructors "--injective-type-constructors"
-  , infectiveOption optExperimentalIrrelevance "--experimental-irrelevance"
-  , infectiveOption optCumulativity           "--cumulativity"
-  , infectiveOption optAllowExec              "--allow-exec"
   ]
   where
   cubicalCompatible =
@@ -1497,7 +1493,7 @@ standardOptions =
 
     , Option ['?']  ["help"]    (OptArg helpFlag "TOPIC") $ concat
                     [ "print help and exit; available "
-                    , singPlural allHelpTopics "TOPIC" "TOPICs"
+                    , String.pluralS allHelpTopics "TOPIC"
                     , ": "
                     , intercalate ", " $ map fst allHelpTopics
                     ]
@@ -1970,14 +1966,12 @@ getOptSimple argv opts fileArg = \ defaults ->
     (_, _, unrecognized, errs) -> throwError $ umsg ++ emsg
 
       where
-      ucap = "Unrecognized " ++ plural unrecognized "option" ++ ":"
-      ecap = plural errs "Option error" ++ ":"
+      ucap = "Unrecognized " ++ String.pluralS unrecognized "option" ++ ":"
+      ecap = String.pluralS errs "Option error" ++ ":"
       umsg = if null unrecognized then "" else unlines $
        ucap : map suggest unrecognized
       emsg = if null errs then "" else unlines $
        ecap : errs
-      plural [_] x = x
-      plural _   x = x ++ "s"
 
       -- Suggest alternatives that are at most 3 typos away
 

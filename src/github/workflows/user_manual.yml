@@ -59,6 +59,7 @@ jobs:
           fancyvrb
           float
           fncychap
+          fontawesome5
           framed
           keystroke
           latexmk
@@ -74,6 +75,7 @@ jobs:
           upquote
           varwidth
           wrapfig
+          xcolor
           zapfchan
 
     - name: Build User Manual in HTML

@@ -1,7 +1,5 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE ViewPatterns #-}
-
 -- | Preprocessors for literate code formats.
 
 module Agda.Syntax.Parser.Literate
@@ -35,7 +33,9 @@ import Agda.Syntax.Common
 import Agda.Syntax.Position
 
 import Agda.Utils.List
+import Agda.Utils.List1 (List1)
 import qualified Agda.Utils.List1 as List1
+import Agda.Utils.Singleton
 
 import Agda.Utils.Impossible
 
@@ -105,6 +105,7 @@ literateProcessors =
     , (".tex", (literateTeX, TexFileType))
     , (".md",  (literateMd,  MdFileType ))
     , (".org", (literateOrg, OrgFileType))
+    , (".tree", (literateTree, TreeFileType))
     -- For now, treat typst as markdown because they use the same
     -- syntax for code blocks.
     , (".typ", (literateMd,  TypstFileType))
@@ -146,8 +147,8 @@ isBlank = (&&) <$> isSpace <*> (/= '\n')
 -- | Short list of extensions for literate Agda files.
 --   For display purposes.
 
-literateExtsShortList :: [String]
-literateExtsShortList = [".lagda"]
+literateExtsShortList :: List1 String
+literateExtsShortList = singleton ".lagda"
 
 -- | Returns a tuple consisting of the first line of the input, and the rest
 --   of the input.
@@ -314,3 +315,29 @@ literateOrg pos s = mkLayers pos $ org s
   rex' :: String -> Regex
   -- Source blocks start with `#+begin_src` but the casing does not matter.
   rex' = makeRegexOpts blankCompOpt{newSyntax = True, caseSensitive = False} blankExecOpt
+
+-- | Preprocessor for Forester documents
+
+literateTree :: Position -> String -> [Layer]
+literateTree pos s = mkLayers pos (tree s)
+  where
+  tree :: String -> [(LayerRole, String)]
+  tree = caseLine [] $ \ line rest ->
+    case tree_begin `matchM` line of
+      Just (getAllTextSubmatches -> [_, pre, _, markup, whitespace]) ->
+        (Comment, pre) : (Markup, markup) :
+        (Code, whitespace) : code rest
+      Just _  -> __IMPOSSIBLE__
+      Nothing -> (Comment, line) : tree rest
+
+  tree_begin = rex "(([^\\%]|\\\\.)*)(\\\\agda\\{[^\n]*)(\n)?"
+
+  code :: String -> [(LayerRole, String)]
+  code = caseLine [] $ \ line rest ->
+    case tree_end `matchM` line of
+      Just (getAllTextSubmatches -> [_, code, markup, post]) ->
+        (Code, code) : (Markup, markup) : (Comment, post) : tree rest
+      Just _  -> __IMPOSSIBLE__
+      Nothing -> (Code, line) : code rest
+
+  tree_end = rex "([[:blank:]]*)(\\})(.*)"

@@ -1,6 +1,4 @@
-Issue1698-field.agda:2,7-7
-Issue1698-field.agda:2,7: Parse error
-=<ERROR>
- Set
+Issue1698-field.agda:2.7: error: [ParseError]
+=<ERROR>  Set
 
 -- Error IS:  Parse erro...

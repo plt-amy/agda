@@ -93,6 +93,8 @@ instance EmbPrj HP.OtherAspect where
   icod_ HP.MissingDefinition    = pure 13
   icod_ HP.ShadowingInTelescope = pure 14
   icod_ HP.Subtree              = pure 15
+  icod_ HP.CosmeticProblem      = pure 16
+  icod_ HP.InstanceProblem      = pure 17
 
   value = \case
     0  -> pure HP.Error
@@ -111,6 +113,8 @@ instance EmbPrj HP.OtherAspect where
     13 -> pure HP.MissingDefinition
     14 -> pure HP.ShadowingInTelescope
     15 -> pure HP.Subtree
+    16 -> pure HP.CosmeticProblem
+    17 -> pure HP.InstanceProblem
     _  -> malformed
 
 instance EmbPrj HP.Aspects where

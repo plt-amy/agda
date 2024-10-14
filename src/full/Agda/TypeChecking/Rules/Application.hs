@@ -13,9 +13,7 @@ module Agda.TypeChecking.Rules.Application
 import Prelude hiding ( null )
 
 import Control.Applicative        ( (<|>) )
-import Control.Monad              ( filterM, forM, forM_, guard, liftM2 )
 import Control.Monad.Except       ( ExceptT, runExceptT, MonadError, catchError, throwError )
-import Control.Monad.Trans
 import Control.Monad.Trans.Maybe
 
 import Data.Bifunctor
@@ -56,8 +54,10 @@ import Agda.TypeChecking.Rules.Def
 import Agda.TypeChecking.Rules.Term
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Telescope
+import Agda.TypeChecking.Warnings (warning)
 
 import Agda.Utils.Either
+import Agda.Utils.Function
 import Agda.Utils.Functor
 import Agda.Utils.Lens
 import Agda.Utils.List  ( (!!!), initWithDefault )
@@ -73,20 +73,42 @@ import Agda.Utils.Tuple
 
 import Agda.Utils.Impossible
 
------------------------------------------------------------------------------
--- * Applications
------------------------------------------------------------------------------
+---------------------------------------------------------------------------
+-- * Data structures for checking arguments
+---------------------------------------------------------------------------
 
 -- | Ranges of checked arguments, where present.
 type MaybeRanges = [Maybe Range]
 
-acHeadConstraints :: (Elims -> Term) -> ArgsCheckState a -> [Constraint]
-acHeadConstraints hd ACState{acElims = es, acConstraints = cs} = go hd es cs
+acElims :: ArgsCheckState a -> [Elim]
+acElims = map caElim . acCheckedArgs
+
+acRanges :: ArgsCheckState a -> MaybeRanges
+acRanges = map caRange . acCheckedArgs
+
+setACElims :: [Elim] -> ArgsCheckState a -> ArgsCheckState a
+setACElims es st = st{ acCheckedArgs = go es (acCheckedArgs st) }
   where
-    go hd [] [] = []
-    go hd (e : es) (c : cs) = maybe id (\ c -> (lazyAbsApp c (hd []) :)) c $ go (hd . (e :)) es cs
-    go _  [] (_:_) = __IMPOSSIBLE__
-    go _  (_:_) [] = __IMPOSSIBLE__
+    go [] [] = []
+    go (e : es) (ca : cas) = ca{ caElim = e } : go es cas
+    go _ _ = __IMPOSSIBLE__
+
+-- | A checked argument without constraint or range.
+defaultCheckedArg :: Elim -> CheckedArg
+defaultCheckedArg e = CheckedArg { caElim = e, caRange = Nothing, caConstraint = Nothing }
+
+-----------------------------------------------------------------------------
+-- * Applications
+-----------------------------------------------------------------------------
+
+acHeadConstraints :: (Elims -> Term) -> ArgsCheckState a -> [Constraint]
+acHeadConstraints hd = go hd . acCheckedArgs
+  where
+    go :: (Elims -> Term) -> [CheckedArg] -> [Constraint]
+    go hd = \case
+      [] -> []
+      CheckedArg e _ mc : cas -> applyWhenJust mc (\ c -> (lazyAbsApp c (hd []) :)) $
+        go (hd . (e :)) cas
 
 checkHeadConstraints :: (Elims -> Term) -> ArgsCheckState a -> TCM Term
 checkHeadConstraints hd st = do
@@ -428,17 +450,16 @@ checkHeadApplication cmp e t hd args = do
   defaultResult' mk = do
     (f, t0) <- inferHead hd
     expandLast <- asksTC envExpandLast
-    checkArguments cmp expandLast (getRange hd) args t0 t $ \ st@(ACState rs vs _ t1 checkedTarget) -> do
-      let check = do
-           k <- mk
-           as <- allApplyElims vs
-           pure $ k rs as t1
-      vs <- case check of
-              Just ck -> do
-                map Apply <$> ck
-              Nothing -> do
-                return vs
-      v <- unfoldInlined =<< checkHeadConstraints f (st { acElims = vs })
+    checkArguments cmp expandLast (getRange hd) args t0 t $ \ st@(ACState cas t1 checkedTarget) -> do
+      let check :: Maybe (TCM Args)
+          check = do
+            k <- mk
+            vs <- allApplyElims $ map caElim cas
+            pure $ k (map caRange cas) vs t1
+      st' <- case check of
+               Just ck -> (`setACElims` st) . map Apply <$> ck
+               Nothing -> pure st
+      v <- unfoldInlined =<< checkHeadConstraints f st'
       coerce' cmp checkedTarget v t1 t
 
 -- Issue #3019 and #4170: Don't insert trailing implicits when checking arguments to existing
@@ -527,17 +548,17 @@ data SkipCheck
     -- ^ Skip the given number of checks.
   | DontSkip
 
+type CheckArgumentsE' = ExceptT (ArgsCheckState [NamedArg A.Expr]) TCM (ArgsCheckState CheckedTarget)
+
 checkArgumentsE'
   :: CheckArgumentsE'State
-  -> ExceptT (ArgsCheckState [NamedArg A.Expr]) TCM (ArgsCheckState CheckedTarget)
+  -> CheckArgumentsE'
 
 -- Case: no arguments, do not insert trailing hidden arguments: We are done.
 checkArgumentsE' S{ sArgs = [], .. }
   | isDontExpandLast sExpand =
     return $ ACState
-      { acRanges      = []
-      , acElims       = []
-      , acConstraints = []
+      { acCheckedArgs = []
       , acType        = sFun
       , acData        = sChecked
       }
@@ -548,9 +569,7 @@ checkArgumentsE' S{ sArgs = [], .. } =
     sApp    <- traverse (unEl <.> reduce) sApp
     (us, t) <- implicitArgs (-1) (expand sApp) sFun
     return $ ACState
-      { acRanges      = replicate (length us) Nothing
-      , acElims       = map Apply us
-      , acConstraints = replicate (length us) Nothing
+      { acCheckedArgs = map (defaultCheckedArg . Apply) us
       , acType        = t
       , acData        = sChecked
       }
@@ -603,9 +622,7 @@ checkArgumentsE'
       -- We are done inserting implicit args.  Now, try to check @arg@.
       ifBlocked sFun
         (\_ sFun -> throwError $ ACState
-            { acRanges      = replicate (length us) Nothing
-            , acElims       = us
-            , acConstraints = replicate (length us) Nothing
+            { acCheckedArgs = map defaultCheckedArg us
             , acType        = sFun
             , acData        = map fst sArgs
             }) $ \_ sFun -> do
@@ -613,25 +630,24 @@ checkArgumentsE'
         -- What can go wrong?
 
         -- 1. We ran out of function types.
-        let shouldBePi
+        let shouldBePi =
               -- a) It is an explicit argument, but we ran out of function types.
-              | visible info = lift $ typeError $ ShouldBePi sFun
+              if visible info then liftTCM . typeError $ ShouldBePi sFun
               -- b) It is an implicit argument, and we did not insert any implicits.
               --    Thus, the type was not a function type to start with.
-              | null xs        = lift $ typeError $ ShouldBePi sFun
+              else List1.ifNull xs {-then-} (liftTCM . typeError $ ShouldBePi sFun)
               -- c) We did insert implicits, but we ran out of implicit function types.
               --    Then, we should inform the user that we did not find his one.
-              | otherwise      = lift $ typeError $ WrongNamedArgument arg xs
+              {-else-} (liftTCM . typeError . WrongNamedArgument arg)
 
         -- 2. We have a function type left, but it is the wrong one.
         --    Our argument must be implicit, case a) is impossible.
         --    (Otherwise we would have ran out of function types instead.)
-        let wrongPi
+        let wrongPi = List1.ifNull xs
               -- b) We have not inserted any implicits.
-              | null xs   = lift $ typeError $
-                            WrongHidingInApplication sFun
+                {-then-} (liftTCM . typeError $ WrongHidingInApplication sFun)
               -- c) We inserted implicits, but did not find his one.
-              | otherwise = lift $ typeError $ WrongNamedArgument arg xs
+                {-else-} (liftTCM . typeError . WrongNamedArgument arg)
 
         let (skip, next) = case sSkipCheck of
               Skip       -> (True, Skip)
@@ -765,7 +781,8 @@ checkArgumentsE'
                   addContext (defaultDom $ sFun) $
                   maybe (text "nothing") (prettyTCM . absBody) c
                 -- save relevance info' from domain in argument
-                addCheckedArgs us (getRange e) (Apply $ Arg info' u) c $
+                let ca = CheckedArg{ caElim = Apply (Arg info' u), caRange = Just (getRange e), caConstraint = c }
+                addCheckedArgs us ca $
                   checkArgumentsE' s{ sFun = absApp b u }
             | otherwise -> do
                 reportSDoc "error" 10 $ nest 2 $ vcat
@@ -780,7 +797,12 @@ checkArgumentsE'
             , PathType sort _ _ bA x y <- sPathView sFun -> do
                 lift $ reportSDoc "tc.term.args" 30 $ text $ show bA
                 u <- lift $ checkExpr (namedThing e) =<< primIntervalType
-                addCheckedArgs us (getRange e) (IApply (unArg x) (unArg y) u) Nothing $
+                let ca = CheckedArg
+                     { caElim       = IApply (unArg x) (unArg y) u
+                     , caRange      = Just (getRange e)
+                     , caConstraint = Nothing
+                     }
+                addCheckedArgs us ca $
                   checkArgumentsE'
                     s{ sChecked = NotCheckedTarget
                      , sFun     = El sort $ unArg bA `apply` [argN u]
@@ -788,15 +810,16 @@ checkArgumentsE'
           _ -> shouldBePi
   where
     -- Andrea: Here one would add constraints too.
-    addCheckedArgs us r u c rec = do
-        st@ACState{acRanges = rs, acElims = vs} <- rec
-        let rs' = replicate (length us) Nothing ++ Just r : rs
-            cs' = replicate (length us) Nothing ++ c : acConstraints st
-        return $ st { acRanges = rs', acElims = us ++ u : vs, acConstraints = cs' }
-      `catchError` \ st@ACState{acRanges = rs, acElims = vs} -> do
-          let rs' = replicate (length us) Nothing ++ Just r : rs
-              cs' = replicate (length us) Nothing ++ c : acConstraints st
-          throwError $ st { acRanges = rs', acElims = us ++ u : vs, acConstraints = cs' }
+    addCheckedArgs ::
+         Elims
+      -> CheckedArg
+      -> CheckArgumentsE'
+      -> CheckArgumentsE'
+    addCheckedArgs us ca cont = do
+      let upd :: ArgsCheckState a -> ArgsCheckState a
+          upd st = st{ acCheckedArgs = map defaultCheckedArg us ++ ca : acCheckedArgs st }
+      -- Add checked arguments to both regular and exceptional result of @cont@.
+      withError upd $ upd <$> cont
 
 -- | The result of 'isRigid'.
 
@@ -868,11 +891,11 @@ checkArguments_ cmp exh r args tel = postponeInstanceConstraints $ do
     z <- runExceptT $
       checkArgumentsE cmp exh r args (telePi tel __DUMMY_TYPE__) Nothing
     case z of
-      Right (ACState _ args cs t _) | all isNothing cs -> do
+      Right (ACState cas t _) -> do
+        unless (all (isNothing . caConstraint) cas) do
+          typeError $ GenericError $ "Head constraints are not (yet) supported in this position."
         let TelV tel' _ = telView' t
-        return (args, tel')
-                                    | otherwise -> do
-        typeError $ GenericError $ "Head constraints are not (yet) supported in this position."
+        return (map caElim cas, tel')
       Left _ -> __IMPOSSIBLE__  -- type cannot be blocked as it is generated by telePi
 
 -- | @checkArguments cmp exph r args t0 t k@ tries @checkArgumentsE exph args t0 t@.
@@ -895,17 +918,19 @@ checkArguments cmp exph r args t0 t k = postponeInstanceConstraints $ do
 
 postponeArgs :: (ArgsCheckState [NamedArg A.Expr]) -> Comparison -> ExpandHidden -> Range -> [NamedArg A.Expr] -> Type ->
                 (ArgsCheckState CheckedTarget -> TCM Term) -> TCM Term
-postponeArgs (ACState rs us cs t0 es) cmp exph r args t k = do
+postponeArgs (ACState cas t0 es) cmp exph r args t k = do
   reportSDoc "tc.term.expr.args" 80 $
     sep [ "postponed checking arguments"
         , nest 4 $ prettyList (map (prettyA . namedThing . unArg) args)
         , nest 2 $ "against"
         , nest 4 $ prettyTCM t0 ] $$
     sep [ "progress:"
-        , nest 2 $ "checked" <+> prettyList (map prettyTCM us)
+        , nest 2 $ "checked" <+> prettyList (map (prettyTCM . caElim) cas)
         , nest 2 $ "remaining" <+> sep [ prettyList (map (prettyA . namedThing . unArg) es)
                                             , nest 2 $ ":" <+> prettyTCM t0 ] ]
-  postponeTypeCheckingProblem_ (CheckArgs cmp exph r es t0 t $ \ (ACState rs' vs cs' t pid) -> k $ ACState (rs ++ rs') (us ++ vs) (cs ++ cs') t pid)
+  postponeTypeCheckingProblem_ $
+    CheckArgs cmp exph r es t0 t $ \ (ACState cas' t pid) ->
+      k $ ACState (cas ++ cas') t pid
 
 -----------------------------------------------------------------------------
 -- * Constructors
@@ -971,7 +996,7 @@ checkConstructorApplication cmp org t c args = do
                args' = dropArgs pnames args
            -- check the non-parameter arguments
            expandLast <- asksTC envExpandLast
-           checkArguments cmp expandLast (getRange c) args' ctype' t $ \ st@(ACState _ _ _ t' targetCheck) -> do
+           checkArguments cmp expandLast (getRange c) args' ctype' t $ \ st@(ACState _ t' targetCheck) -> do
              reportSDoc "tc.term.con" 20 $ nest 2 $ vcat
                [ text "es     =" <+> prettyTCM es
                , text "t'     =" <+> prettyTCM t' ]
@@ -1047,7 +1072,7 @@ disambiguateConstructor cs0 args t = do
         def <- getConInfo con
         pure (getData (theDef def), t, setConName c con)
       -- Type error
-      let badCon t = typeError $ DoesNotConstructAnElementOf c0 t
+      let badCon t = typeError $ ConstructorDoesNotTargetGivenType c0 t
 
       -- Lets look at the target type at this point
       TelV tel t1 <- telViewPath t
@@ -1160,7 +1185,7 @@ getTypeHead t = do
     case nb of
       ReallyNotBlocked -> do
         -- Drop initial hidden domains (only needed for generalizable variables).
-        TelV _ core <- telViewUpTo' (0-1) (not . visible) t
+        TelV _ core <- telViewUpTo' (negate 1) (not . visible) t
         case unEl core of
           Def q _ -> return $ Just q
           _ -> return Nothing
@@ -1269,9 +1294,8 @@ inferOrCheckProjApp e o ds args mt = do
       ifBlocked core (\ m _ -> postpone m) $ {-else-} \ _ core -> do
       ifNotPiType core (\ _ -> refuseProjNotApplied ds) $ {-else-} \ dom _b -> do
       ifBlocked (unDom dom) (\ m _ -> postpone m) $ {-else-} \ _ ta -> do
-      caseMaybeM (isRecordType ta) (refuseProjNotRecordType ds Nothing ta) $ \ (_q, _pars, defn) -> do
-      case defn of
-        Record { recFields = fs } -> do
+      caseMaybeM (isRecordType ta) (refuseProjNotRecordType ds Nothing ta)
+        \ (_q, _pars, RecordData{ _recFields = fs }) -> do
           case forMaybe fs $ \ f -> Fold.find (unDom f ==) ds of
             [] -> refuseProjNoMatching ds
             [d] -> do
@@ -1280,7 +1304,6 @@ inferOrCheckProjApp e o ds args mt = do
               (, t, CheckedTarget Nothing) <$>
                 checkHeadApplication cmp e t (A.Proj o $ unambiguous d) args
             _ -> __IMPOSSIBLE__
-        _ -> __IMPOSSIBLE__
 
     -- Case: we have a visible argument
     ((k, arg) : _) -> do
@@ -1408,7 +1431,7 @@ inferOrCheckProjAppToKnownPrincipalArg e o ds args mt k v0 ta mpatm = do
               args' = drop (k + 1) args
           z <- runExceptT $ checkArgumentsE cmp ExpandLast r args' tb (snd <$> mt)
           case z of
-            Right st@(ACState _ _ _ trest targetCheck) -> do
+            Right st@(ACState _ trest targetCheck) -> do
               v <- checkHeadConstraints (u `applyE`) st
               return (v, trest, targetCheck)
             Left problem -> do
@@ -1416,7 +1439,7 @@ inferOrCheckProjAppToKnownPrincipalArg e o ds args mt k v0 ta mpatm = do
               -- To create a postponed type checking problem,
               -- we do not use typeDontCare, but create a meta.
               tc <- caseMaybe mt newTypeMeta_ (return . snd)
-              v  <- postponeArgs problem cmp ExpandLast r args' tc $ \ st@(ACState _ _ _ trest targetCheck) -> do
+              v  <- postponeArgs problem cmp ExpandLast r args' tc $ \ st@(ACState _ trest targetCheck) -> do
                       v <- checkHeadConstraints (u `applyE`) st
                       coerce' cmp targetCheck v trest tc
 
@@ -1475,13 +1498,12 @@ inferLeveledSort u q suffix = \case
   [] -> do
     let n = suffixToLevel suffix
     return (Sort (Univ u $ ClosedLevel n) , sort (Univ (univUniv u) $ ClosedLevel $ n + 1))
-  [arg] -> do
+  arg : args -> do
     unless (visible arg) $ typeError $ WrongHidingInApplication $ sort $ Univ u $ ClosedLevel 0
-    unlessM hasUniversePolymorphism $ genericError
-      "Use --universe-polymorphism to enable level arguments to Set"
-    l <- applyRelevanceToContext NonStrict $ checkLevel arg
+    unlessM hasUniversePolymorphism $ typeError NeedOptionUniversePolymorphism
+    List1.unlessNull args $ warning . TooManyArgumentsToSort q
+    l <- applyRelevanceToContext shapeIrrelevant $ checkLevel arg
     return (Sort $ Univ u l , sort (Univ (univUniv u) $ levelSuc l))
-  arg : _ -> typeError $ TooManyArgumentsToLeveledSort q
 
 inferUnivOmega ::
      Univ                -- ^ The universe type.
@@ -1489,11 +1511,10 @@ inferUnivOmega ::
   -> Suffix              -- ^ Level of the universe given via suffix (optional).
   -> [NamedArg A.Expr]   -- ^ Level of the universe given via argument (should be absent).
   -> TCM (Term, Type)    -- ^ Universe and its sort.
-inferUnivOmega u q suffix = \case
-  [] -> do
+inferUnivOmega u q suffix args = do
+    List1.unlessNull args $ warning . TooManyArgumentsToSort q
     let n = suffixToLevel suffix
     return (Sort (Inf u n) , sort (Inf (univUniv u) $ 1 + n))
-  arg : _ -> typeError $ TooManyArgumentsToUnivOmega q
 
 -----------------------------------------------------------------------------
 -- * Coinduction
@@ -1705,11 +1726,15 @@ checkPOr c rs vs _ = do
       phi <- intervalUnview (IMin phi1 phi2)
       reportSDoc "tc.term.por" 10 $ text (show phi)
       t1 <- runNamesT [] $ do
-             [l,a] <- mapM (open . unArg) [l,a]
+             l <- open . unArg $ l
+             a <- open . unArg $ a
              psi <- open =<< intervalUnview (IMax phi1 phi2)
              pPi' "o" psi $ \ o -> el' l (a <..> o)
       tv <- runNamesT [] $ do
-             [l,a,phi1,phi2] <- mapM (open . unArg) [l,a,phi1,phi2]
+             l    <- open . unArg $ l
+             a    <- open . unArg $ a
+             phi1 <- open . unArg $ phi1
+             phi2 <- open . unArg $ phi2
              pPi' "o" phi2 $ \ o -> el' l (a <..> (cl primIsOne2 <@> phi1 <@> phi2 <@> o))
       v <- blockArg tv (rs !!! 5) v $ do
         -- ' φ₁ ∧ φ₂  ⊢ u , v : PartialP (φ₁ ∨ φ₂) \ o → a o
@@ -1727,15 +1752,22 @@ check_glue c rs vs _ = do
   case vs of
    -- WAS: [la, lb, bA, phi, bT, e, t, a] -> do
    la : lb : bA : phi : bT : e : t : a : rest -> do
-      let iinfo = setRelevance Irrelevant defaultArgInfo
       v <- runNamesT [] $ do
-            [lb, la, bA, phi, bT, e, t] <- mapM (open . unArg) [lb, la, bA, phi, bT, e, t]
+            lb  <- open . unArg $ lb
+            la  <- open . unArg $ la
+            bA  <- open . unArg $ bA
+            phi <- open . unArg $ phi
+            bT  <- open . unArg $ bT
+            e   <- open . unArg $ e
+            t   <- open . unArg $ t
             let f o = cl primEquivFun <#> lb <#> la <#> (bT <..> o) <#> bA <@> (e <..> o)
-            glam iinfo "o" $ \ o -> f o <@> (t <..> o)
+            glam defaultIrrelevantArgInfo "o" $ \ o -> f o <@> (t <..> o)
       ty <- runNamesT [] $ do
-            [lb, phi, bA] <- mapM (open . unArg) [lb, phi, bA]
-            el's lb $ cl primPartialP <#> lb <@> phi <@> glam iinfo "o" (\ _ -> bA)
-      let a' = Lam iinfo (NoAbs "o" $ unArg a)
+            lb  <- open . unArg $ lb
+            phi <- open . unArg $ phi
+            bA  <- open . unArg $ bA
+            el's lb $ cl primPartialP <#> lb <@> phi <@> glam defaultIrrelevantArgInfo "o" (\ _ -> bA)
+      let a' = Lam defaultIrrelevantArgInfo (NoAbs "o" $ unArg a)
       ta <- el' (pure $ unArg la) (pure $ unArg bA)
       a <- blockArg ta (rs !!! 7) a $ equalTerm ty a' v
       return $ la : lb : bA : phi : bT : e : t : a : rest
@@ -1753,17 +1785,25 @@ check_glueU c rs vs _ = do
   case vs of
    -- WAS: [la, lb, bA, phi, bT, e, t, a] -> do
    la : phi : bT : bA : t : a : rest -> do
-      let iinfo = setRelevance Irrelevant defaultArgInfo
       v <- runNamesT [] $ do
-            [la, phi, bT, bA, t] <- mapM (open . unArg) [la, phi, bT, bA, t]
+            la  <- open . unArg $ la
+            phi <- open . unArg $ phi
+            bT  <- open . unArg $ bT
+            bA  <- open . unArg $ bA
+            t   <- open . unArg $ t
             let f o = cl primTrans <#> lam "i" (const la) <@> lam "i" (\ i -> bT <@> (cl primINeg <@> i) <..> o) <@> cl primIZero
-            glam iinfo "o" $ \ o -> f o <@> (t <..> o)
+            glam defaultIrrelevantArgInfo "o" $ \ o -> f o <@> (t <..> o)
       ty <- runNamesT [] $ do
-            [la, phi, bT] <- mapM (open . unArg) [la, phi, bT]
+            la  <- open . unArg $ la
+            phi <- open . unArg $ phi
+            bT  <- open . unArg $ bT
             pPi' "o" phi $ \ o -> el' la (bT <@> cl primIZero <..> o)
-      let a' = Lam iinfo (NoAbs "o" $ unArg a)
+      let a' = Lam defaultIrrelevantArgInfo (NoAbs "o" $ unArg a)
       ta <- runNamesT [] $ do
-            [la, phi, bT, bA] <- mapM (open . unArg) [la, phi, bT, bA]
+            la  <- open . unArg $ la
+            phi <- open . unArg $ phi
+            bT  <- open . unArg $ bT
+            bA  <- open . unArg $ bA
             el' la (cl primSubOut <#> (cl primLevelSuc <@> la) <#> (Sort . tmSort <$> la) <#> phi <#> (bT <@> cl primIZero) <@> bA)
       a <- blockArg ta (rs !!! 5) a $ equalTerm ty a' v
       return $ la : phi : bT : bA : t : a : rest

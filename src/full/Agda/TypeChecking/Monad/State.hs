@@ -131,7 +131,7 @@ freshTCM m = do
       case err of
         TypeError { tcErrState = s } ->
           setTCLens lensPersistentState $ s ^. lensPersistentState
-        IOException s _ _ ->
+        IOException (Just s) _ _ ->
           setTCLens lensPersistentState $ s ^. lensPersistentState
         _ -> return ()
       return $ Left err
@@ -215,13 +215,13 @@ localScope m = do
 -- | Scope error.
 notInScopeError :: C.QName -> TCM a
 notInScopeError x = do
-  printScope "unbound" 5 ""
-  typeError $ NotInScope [x]
+  printScope "unbound" 25 ""
+  typeError $ NotInScope x
 
 notInScopeWarning :: C.QName -> TCM ()
 notInScopeWarning x = do
-  printScope "unbound" 5 ""
-  warning $ NotInScopeW [x]
+  printScope "unbound" 25 ""
+  warning $ NotInScopeW x
 
 -- | Debug print the scope.
 printScope :: String -> Int -> String -> TCM ()
@@ -291,6 +291,12 @@ setMatchableSymbols f matchables =
   foldr ((.) . (\g -> updateDefinition g setMatchable)) id matchables
     where
       setMatchable def = def { defMatchable = Set.insert f $ defMatchable def }
+
+-- ** 'modify' methods for the signature
+
+modifyRecEta :: MonadTCState m => QName -> (EtaEquality -> EtaEquality) -> m ()
+modifyRecEta q f =
+  modifySignature $ updateDefinition q $ over (lensTheDef . lensRecord . lensRecEta) f
 
 -- ** Modifiers for parts of the signature
 
@@ -389,14 +395,9 @@ setTopLevelModule top = do
 currentTopLevelModule ::
   (MonadTCEnv m, ReadTCState m) => m (Maybe TopLevelModuleName)
 currentTopLevelModule = do
-  m <- useR stCurrentModule
-  case m of
+  useR stCurrentModule >>= \case
     Just (_, top) -> return (Just top)
-    Nothing       -> do
-      p <- asksTC envImportPath
-      return $ case p of
-        top : _ -> Just top
-        []      -> Nothing
+    Nothing       -> listToMaybe <$> asksTC envImportPath
 
 -- | Use a different top-level module for a computation. Used when generating
 --   names for imported modules.

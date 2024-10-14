@@ -13,6 +13,8 @@ import Control.Monad.IO.Class ( MonadIO(..) )
 
 import qualified Data.List as List
 import Data.Maybe
+import qualified Data.Set as Set
+import qualified Data.Text as T
 
 import System.Environment
 import System.Exit
@@ -22,7 +24,7 @@ import qualified System.IO as IO
 import Paths_Agda            ( getDataDir )
 
 import Agda.Interaction.CommandLine
-import Agda.Interaction.ExitCode (AgdaError(..), exitSuccess, exitAgdaWith)
+import Agda.Interaction.ExitCode as ExitCode (AgdaError(..), exitSuccess, exitAgdaWith)
 import Agda.Interaction.Options
 import Agda.Interaction.Options.Help (Help (..))
 import Agda.Interaction.EmacsTop (mimicGHCi)
@@ -187,7 +189,7 @@ getInteractor configuredBackends maybeInputFile opts =
     pluralize w []  = concat ["(no ", w, ")"]
     pluralize w [x] = concat [w, " ", x]
     pluralize w xs  = concat [w, "s (", List.intercalate ", " xs, ")"]
-    enabledBackendNames  = pluralize "backend" [ backendName b | Backend b <- enabledBackends ]
+    enabledBackendNames  = pluralize "backend" [ T.unpack $ backendName b | Backend b <- enabledBackends ]
     enabledFrontendNames = pluralize "frontend" (frontendFlagName <$> enabledFrontends)
     frontendFlagName = ("--" ++) . \case
       FrontEndEmacs -> "interaction"
@@ -245,17 +247,16 @@ runAgdaWithOptions interactor progName opts = do
           result <- Imp.typeCheckMain mode =<< Imp.parseSource (SourceFile inputFile)
 
           unless (crMode result == ModuleScopeChecked) $
-            unlessNullM (applyFlagsToTCWarnings (crWarnings result)) $ \ ws ->
-              typeError $ NonFatalErrors ws
+            Imp.raiseNonFatalErrors result
 
           let i = crInterface result
           reportSDoc "main" 50 $ pretty i
 
           -- Print accumulated warnings
-          unlessNullM (tcWarnings . classifyWarnings <$> getAllWarnings AllWarnings) $ \ ws -> do
+          unlessNullM (tcWarnings . classifyWarnings . Set.toAscList <$> getAllWarnings AllWarnings) $ \ ws -> do
             let banner = text $ "\n" ++ delimiter "All done; warnings encountered"
             alwaysReportSDoc "warning" 1 $
-              vcat $ punctuate "\n" $ banner : (prettyTCM <$> ws)
+              vsep $ (banner :) $ map prettyTCM $ Set.toAscList ws
 
           return result
 
@@ -270,7 +271,7 @@ printUsage backends hp = do
 
 backendUsage :: Backend -> String
 backendUsage (Backend b) =
-  usageInfo ("\n" ++ backendName b ++ " backend options") $
+  usageInfo ("\n" ++ T.unpack (backendName b) ++ " backend options") $
     map void (commandLineFlags b)
 
 -- | Print version information.
@@ -281,7 +282,7 @@ printVersion backends PrintAgdaVersion = do
   unless (null flags) $
     mapM_ putStrLn $ ("Built with flags (cabal -f)" :) $ map bullet flags
   mapM_ putStrLn
-    [ bullet $ name ++ " backend version " ++ ver
+    [ bullet $ T.unpack $ T.unwords [ name, "backend version", ver ]
     | Backend Backend'{ backendName = name, backendVersion = Just ver } <- backends ]
   where
   bullet = (" - " ++)
@@ -315,7 +316,7 @@ optionError :: String -> IO ()
 optionError err = do
   prog <- getProgName
   putStrLn $ "Error: " ++ err ++ "\nRun '" ++ prog ++ " --help' for help on command line options."
-  exitAgdaWith OptionError
+  exitAgdaWith ExitCode.OptionError
 
 -- | Run a TCM action in IO; catch and pretty print errors.
 
@@ -339,12 +340,12 @@ runTCMPrettyErrors tcm = do
           `catchError` \err -> do
             s2s <- prettyTCWarnings' =<< getAllWarningsOfTCErr err
             s1  <- prettyError err
-            ANSI.putDoc (P.vcat s2s P.$+$ s1)
+            ANSI.putDoc $ P.vsep $ s2s ++ [ s1 ]
             liftIO $ do
               helpForLocaleError err
             return (Just TCMError)
       ) `catchImpossible` \e -> do
-          liftIO $ putStr $ E.displayException e
+          printException e
           return (Just ImpossibleError)
     ) `E.catches`
         -- Catch all exceptions except for those of type ExitCode
@@ -354,7 +355,7 @@ runTCMPrettyErrors tcm = do
         [ E.Handler $ \(e :: ExitCode)         -> E.throw e
         , E.Handler $ \(e :: E.AsyncException) -> E.throw e
         , E.Handler $ \(e :: E.SomeException)  -> do
-            liftIO $ putStr $ E.displayException e
+            printException e
             return $ Right (Just UnknownError)
         ]
   case r of
@@ -366,6 +367,15 @@ runTCMPrettyErrors tcm = do
         putStrLn $ tcErrString err
         helpForLocaleError err
       exitAgdaWith UnknownError
+  where
+    printException e = liftIO $ putStr $
+      -- Andreas, 2024-07-03, issue #7299
+      -- Regression in base-4.20: printing of exception produces trailing whitespace.
+      -- https://gitlab.haskell.org/ghc/ghc/-/issues/25052
+#if MIN_VERSION_base(4,20,0)
+      rtrim $
+#endif
+      E.displayException e
 
 -- | If the error is an IO error, and the error message suggests that
 -- the problem is related to locales or code pages, print out some

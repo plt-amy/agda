@@ -1,5 +1,4 @@
 {-# LANGUAGE AllowAmbiguousTypes #-}
-{-# LANGUAGE ViewPatterns        #-}
 {-# LANGUAGE TypeApplications    #-}
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
@@ -21,7 +20,6 @@ module Agda.TypeChecking.Substitute
   ) where
 
 import Control.Arrow (first, second)
-import Control.Monad (guard)
 
 import Data.Coerce
 import Data.Function (on)
@@ -49,6 +47,7 @@ import Agda.TypeChecking.Substitute.DeBruijn
 
 import Agda.Utils.Either
 import Agda.Utils.Empty
+import Agda.Utils.Function (applyWhen)
 import Agda.Utils.Functor
 import Agda.Utils.List
 import Agda.Utils.List1 (List1, pattern (:|))
@@ -187,9 +186,7 @@ argToDontCare :: Arg Term -> Term
 argToDontCare (Arg ai v) = relToDontCare ai v
 
 relToDontCare :: LensRelevance a => a -> Term -> Term
-relToDontCare ai v
-  | Irrelevant <- getRelevance ai = dontCare v
-  | otherwise                     = v
+relToDontCare ai = applyWhen (isIrrelevant ai) dontCare
 
 -- Andreas, 2016-01-19: In connection with debugging issue #1783,
 -- I consider the Apply instance for Type harmful, as piApply is not
@@ -233,8 +230,8 @@ instance TermSubst a => Apply (Tele a) where
   applyE t es = apply t $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
 
 instance Apply Definition where
-  apply (Defn info x t pol occ gens gpars df m c inst copy ma nc inj copat blk lang d) args =
-    Defn info x (piApply t args) (apply pol args) (apply occ args) (apply gens args) (drop (length args) gpars) df m c inst copy ma nc inj copat blk lang (apply d args)
+  apply (Defn info x t pol occ gpars df m c inst copy ma nc inj copat blk lang d) args =
+    Defn info x (piApply t args) (apply pol args) (apply occ args) (drop (length args) gpars) df m c inst copy ma nc inj copat blk lang (apply d args)
 
   applyE t es = apply t $ fromMaybe __IMPOSSIBLE__ $ allApplyElims es
 
@@ -303,7 +300,7 @@ instance Apply Defn where
   apply d args@(arg1:args1) = case d of
     Axiom{} -> d
     DataOrRecSig n -> DataOrRecSig (n - length args)
-    GeneralizableVar{} -> d
+    GeneralizableVar gv -> GeneralizableVar $ apply gv args
     AbstractDefn d -> AbstractDefn $ apply d args
     Function{ funClauses = cs, funCompiled = cc, funCovering = cov, funInv = inv
             , funExtLam = extLam
@@ -367,7 +364,7 @@ instance Apply Clause where
     -- It is assumed that we only apply a clause to "parameters", i.e.
     -- arguments introduced by lambda lifting. The problem is that these aren't
     -- necessarily the first elements of the clause telescope.
-    apply cls@(Clause rl rf tel ps b t catchall exact recursive unreachable ell wm) args
+    apply cls@(Clause rl rf tel ps b t catchall recursive unreachable ell wm) args
       | length args > length ps = __IMPOSSIBLE__
       | otherwise =
       Clause rl rf
@@ -376,7 +373,6 @@ instance Apply Clause where
              (applySubst rho b)
              (applySubst rho t)
              catchall
-             exact
              recursive
              unreachable
              ell
@@ -624,8 +620,8 @@ instance Abstract Telescope where
   ExtendTel arg xtel `abstract` tel = ExtendTel arg $ xtel <&> (`abstract` tel)
 
 instance Abstract Definition where
-  abstract tel (Defn info x t pol occ gens gpars df m c inst copy ma nc inj copat blk lang d) =
-    Defn info x (abstract tel t) (abstract tel pol) (abstract tel occ) (abstract tel gens)
+  abstract tel (Defn info x t pol occ gpars df m c inst copy ma nc inj copat blk lang d) =
+    Defn info x (abstract tel t) (abstract tel pol) (abstract tel occ)
       (replicate (size tel) Nothing ++ gpars)
       df m c inst copy ma nc inj copat blk lang (abstract tel d)
 
@@ -665,7 +661,7 @@ instance Abstract Defn where
   abstract tel d = case d of
     Axiom{} -> d
     DataOrRecSig n -> DataOrRecSig (size tel + n)
-    GeneralizableVar{} -> d
+    GeneralizableVar gv -> GeneralizableVar $ abstract tel gv
     AbstractDefn d -> AbstractDefn $ abstract tel d
     Function{ funClauses = cs, funCompiled = cc, funCovering = cov, funInv = inv
             , funExtLam = extLam
@@ -721,13 +717,12 @@ instance Abstract PrimFun where
         where n = size tel
 
 instance Abstract Clause where
-  abstract tel (Clause rl rf tel' ps b t catchall exact recursive unreachable ell wm) =
+  abstract tel (Clause rl rf tel' ps b t catchall recursive unreachable ell wm) =
     Clause rl rf (abstract tel tel')
            (namedTelVars m tel ++ ps)
            b
            t -- nothing to do for t, since it lives under the telescope
            catchall
-           exact
            recursive
            unreachable
            ell
@@ -1090,6 +1085,9 @@ instance Subst a => Subst (Maybe a) where
 
 instance Subst a => Subst [a] where
   type SubstArg [a] = SubstArg a
+
+instance Subst a => Subst (List1 a) where
+  type SubstArg (List1 a) = SubstArg a
 
 instance (Ord k, Subst a) => Subst (Map k a) where
   type SubstArg (Map k a) = SubstArg a

@@ -4,15 +4,13 @@ module Agda.TypeChecking.Monad.MetaVars where
 
 import Prelude hiding (null)
 
-import Control.Monad                ( (<=<), forM_, guard )
-import Control.Monad.Except         ( MonadError )
+import Control.Monad.Except         ( ExceptT, MonadError )
 import Control.Monad.State          ( StateT, execStateT, get, put )
 import Control.Monad.Trans          ( MonadTrans, lift )
 import Control.Monad.Trans.Identity ( IdentityT )
+import Control.Monad.Trans.Maybe    ( MaybeT )
 import Control.Monad.Reader         ( ReaderT(ReaderT), runReaderT )
 import Control.Monad.Writer         ( WriterT, execWriterT, tell )
--- Control.Monad.Fail import is redundant since GHC 8.8.1
-import Control.Monad.Fail (MonadFail)
 
 import qualified Data.HashMap.Strict as HMap
 import qualified Data.List as List
@@ -354,7 +352,7 @@ isGeneralizableMeta x =
 -- | Check whether all metas are instantiated.
 --   Precondition: argument is a meta (in some form) or a list of metas.
 class IsInstantiatedMeta a where
-  isInstantiatedMeta :: (MonadFail m, ReadTCState m) => a -> m Bool
+  isInstantiatedMeta :: (ReadTCState m) => a -> m Bool
 
 {-# SPECIALIZE isInstantiatedMeta :: Term -> TCM Bool #-}
 {-# SPECIALIZE isInstantiatedMeta :: Type -> TCM Bool #-}
@@ -395,7 +393,7 @@ instance IsInstantiatedMeta a => IsInstantiatedMeta (Abs a) where
   isInstantiatedMeta = isInstantiatedMeta . unAbs
 
 {-# SPECIALIZE isInstantiatedMeta' :: MetaId -> TCM (Maybe Term) #-}
-isInstantiatedMeta' :: (MonadFail m, ReadTCState m) => MetaId -> m (Maybe Term)
+isInstantiatedMeta' :: (ReadTCState m) => MetaId -> m (Maybe Term)
 isInstantiatedMeta' m = do
   inst <- lookupMetaInstantiation m
   return $ case inst of
@@ -517,9 +515,12 @@ class (MonadTCEnv m, ReadTCState m) => MonadInteractionPoints m where
     => (InteractionPoints -> InteractionPoints) -> m ()
   modifyInteractionPoints = lift . modifyInteractionPoints
 
+instance MonadInteractionPoints m => MonadInteractionPoints (ExceptT e m)
+instance MonadInteractionPoints m => MonadInteractionPoints (MaybeT m)
 instance MonadInteractionPoints m => MonadInteractionPoints (IdentityT m)
 instance MonadInteractionPoints m => MonadInteractionPoints (ReaderT r m)
 instance MonadInteractionPoints m => MonadInteractionPoints (StateT s m)
+instance (MonadInteractionPoints m, Monoid w) => MonadInteractionPoints (WriterT w m)
 
 instance MonadInteractionPoints TCM where
   freshInteractionId = fresh
@@ -640,22 +641,21 @@ isInteractionMeta x = BiMap.invLookup x <$> useR stInteractionPoints
 -- | Get the information associated to an interaction point.
 {-# SPECIALIZE lookupInteractionPoint :: InteractionId -> TCM InteractionPoint #-}
 lookupInteractionPoint
-  :: (MonadFail m, ReadTCState m, MonadError TCErr m)
+  :: (ReadTCState m, MonadError TCErr m, MonadTCEnv m)
   => InteractionId -> m InteractionPoint
 lookupInteractionPoint ii =
-  fromMaybeM err $ BiMap.lookup ii <$> useR stInteractionPoints
-  where
-    err  = fail $ "no such interaction point: " ++ show ii
+  fromMaybeM (interactionError $ NoSuchInteractionPoint ii) $
+    BiMap.lookup ii <$> useR stInteractionPoints
 
 {-# SPECIALIZE lookupInteractionId :: InteractionId -> TCM MetaId #-}
 -- | Get 'MetaId' for an interaction point.
 --   Precondition: interaction point is connected.
 lookupInteractionId
-  :: (MonadFail m, ReadTCState m, MonadError TCErr m, MonadTCEnv m)
+  :: (ReadTCState m, MonadError TCErr m, MonadTCEnv m)
   => InteractionId -> m MetaId
-lookupInteractionId ii = fromMaybeM err2 $ ipMeta <$> lookupInteractionPoint ii
-  where
-    err2 = typeError $ GenericError $ "No type nor action available for hole " ++ prettyShow ii ++ ". Possible cause: the hole has not been reached during type checking (do you see yellow?)"
+lookupInteractionId ii =
+  fromMaybeM (interactionError $ NoActionForInteractionPoint ii) $
+    ipMeta <$> lookupInteractionPoint ii
 
 -- | Check whether an interaction id is already associated with a meta variable.
 lookupInteractionMeta :: ReadTCState m => InteractionId -> m (Maybe MetaId)
@@ -692,7 +692,7 @@ newMetaTCM' inst frozen mi p perm j = do
 -- | Get the 'Range' for an interaction point.
 {-# SPECIALIZE getInteractionRange :: InteractionId -> TCM Range #-}
 getInteractionRange
-  :: (MonadInteractionPoints m, MonadFail m, MonadError TCErr m)
+  :: (MonadInteractionPoints m, MonadDebug m, MonadError TCErr m)
   => InteractionId -> m Range
 getInteractionRange = ipRange <.> lookupInteractionPoint
 
@@ -702,7 +702,7 @@ getMetaRange ::
 getMetaRange = getRange <.> lookupLocalMeta
 
 getInteractionScope ::
-  (MonadDebug m, MonadFail m, ReadTCState m, MonadError TCErr m,
+  (MonadDebug m, ReadTCState m, MonadError TCErr m,
    MonadTCEnv m) =>
   InteractionId -> m ScopeInfo
 getInteractionScope =
@@ -716,7 +716,7 @@ withMetaInfo mI cont = enterClosure mI $ \ r ->
   setCurrentRange r cont
 
 withInteractionId ::
-  (MonadDebug m, MonadFail m, ReadTCState m, MonadError TCErr m,
+  (MonadDebug m, ReadTCState m, MonadError TCErr m,
    MonadTCEnv m, MonadTrace m) =>
   InteractionId -> m a -> m a
 withInteractionId i ret = do
@@ -793,7 +793,7 @@ solveAwakeConstraints' = solveSomeAwakeConstraints (const True)
 {-# SPECIALIZE freezeMetas :: LocalMetaStore -> TCM (Set MetaId) #-}
 -- | Freeze the given meta-variables (but only if they are open) and
 -- return those that were not already frozen.
-freezeMetas :: forall m. MonadTCState m => LocalMetaStore -> m (Set MetaId)
+freezeMetas :: forall m. (MonadTCState m, ReadTCState m) => LocalMetaStore -> m (Set MetaId)
 freezeMetas ms =
   execWriterT $
   modifyTCLensM stOpenMetaStore $

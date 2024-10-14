@@ -7,7 +7,6 @@ import Prelude hiding ( null )
 
 import Control.Applicative hiding (empty)
 import Control.DeepSeq
-import Control.Monad        ( forM_, guard, liftM2 )
 import Control.Monad.Reader ( MonadReader(..), asks, Reader, runReader )
 
 import Data.Either
@@ -201,9 +200,7 @@ checkStrictlyPositive mi qset = do
         -- 'Inductive' or 'Coinductive'.  Otherwise, error.
         unlessM (isJust . recInduction . theDef <$> getConstInfo q) $
           setCurrentRange (nameBindingSite $ qnameName q) $
-            typeError . GenericDocError =<<
-              "Recursive record" <+> prettyTCM q <+>
-              "needs to be declared as either inductive or coinductive"
+            typeError $ RecursiveRecordNeedsInductivity q
 
     occ (Edge o _) = o
 
@@ -837,7 +834,7 @@ instance PrettyTCM (Seq OccursWhere) where
                           [prettyTCM q]
         UnderInf     -> pwords "under" ++
                         [do -- this cannot fail if an 'UnderInf' has been generated
-                            Def inf _ <- fromMaybe __IMPOSSIBLE__ <$> getBuiltin' builtinInf
+                            inf <- fromMaybe __IMPOSSIBLE__ <$> getBuiltinName' builtinInf
                             prettyTCM inf]
         VarArg       -> pwords "in an argument of a bound variable"
         MetaArg      -> pwords "in an argument of a metavariable"

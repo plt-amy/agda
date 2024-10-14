@@ -84,7 +84,7 @@ import Agda.Utils.Impossible
 %monad { Parser }
 %lexer { lexer } { TokEOF{} }
 
-%expect 8
+%expect 7
 -- * shift/reduce for \ x y z -> foo = bar
 --   shifting means it'll parse as \ x y z -> (foo = bar) rather than
 --   (\ x y z -> foo) = bar
@@ -221,6 +221,8 @@ import Agda.Utils.Impossible
 
     string                    { TokString $$ }
     literal                   { TokLiteral $$ }
+
+    fail                      { TokDummy }    -- We never lex this
 
 %%
 
@@ -444,8 +446,8 @@ DoubleCloseBrace
 -- A possibly dotted identifier.
 MaybeDottedId :: { Arg Name }
 MaybeDottedId
-  : '..' Id { setRelevance NonStrict $ defaultArg $2 }
-  | '.'  Id { setRelevance Irrelevant $ defaultArg $2 }
+  : '..' Id { defaultShapeIrrelevantArg $1 $2 }
+  | '.'  Id { defaultIrrelevantArg $1 $2 }
   | Id      { defaultArg $1 }
 
 -- Space separated list of one or more possibly dotted identifiers.
@@ -464,14 +466,14 @@ ArgIds
     | '{{' MaybeDottedIds DoubleCloseBrace        { fmap makeInstance $2 }
     | '{' MaybeDottedIds '}' ArgIds   { fmap hide $2 <> $4 }
     | '{' MaybeDottedIds '}'          { fmap hide $2 }
-    | '.' '{' SpaceIds '}' ArgIds     { fmap (hide . setRelevance Irrelevant . defaultArg) $3 <> $5 }
-    | '.' '{' SpaceIds '}'            { fmap (hide . setRelevance Irrelevant . defaultArg) $3 }
-    | '.' '{{' SpaceIds DoubleCloseBrace ArgIds   { fmap (makeInstance . setRelevance Irrelevant . defaultArg) $3 <> $5 }
-    | '.' '{{' SpaceIds DoubleCloseBrace          { fmap (makeInstance . setRelevance Irrelevant . defaultArg) $3 }
-    | '..' '{' SpaceIds '}' ArgIds    { fmap (hide . setRelevance NonStrict . defaultArg) $3 <> $5 }
-    | '..' '{' SpaceIds '}'           { fmap (hide . setRelevance NonStrict . defaultArg) $3 }
-    | '..' '{{' SpaceIds DoubleCloseBrace ArgIds  { fmap (makeInstance . setRelevance NonStrict . defaultArg) $3 <> $5 }
-    | '..' '{{' SpaceIds DoubleCloseBrace         { fmap (makeInstance . setRelevance NonStrict . defaultArg) $3 }
+    | '.' '{' SpaceIds '}' ArgIds     { fmap (hide . defaultIrrelevantArg $1) $3 <> $5 }
+    | '.' '{' SpaceIds '}'            { fmap (hide . defaultIrrelevantArg $1) $3 }
+    | '.' '{{' SpaceIds DoubleCloseBrace ArgIds   { fmap (makeInstance . defaultIrrelevantArg $1) $3 <> $5 }
+    | '.' '{{' SpaceIds DoubleCloseBrace          { fmap (makeInstance . defaultIrrelevantArg $1) $3 }
+    | '..' '{' SpaceIds '}' ArgIds    { fmap (hide . defaultShapeIrrelevantArg $1) $3 <> $5 }
+    | '..' '{' SpaceIds '}'           { fmap (hide . defaultShapeIrrelevantArg $1) $3 }
+    | '..' '{{' SpaceIds DoubleCloseBrace ArgIds  { fmap (makeInstance . defaultShapeIrrelevantArg $1) $3 <> $5 }
+    | '..' '{{' SpaceIds DoubleCloseBrace         { fmap (makeInstance . defaultShapeIrrelevantArg $1) $3 }
 
 -- Modalities preceeding identifiers
 
@@ -512,9 +514,9 @@ BId : Id    { $1 }
 -- A binding variable. Can be '_'
 MaybeDottedBId :: { (Relevance, Name) }
 MaybeDottedBId
-    : BId        { (Relevant  , $1) }
-    | '.' BId    { (Irrelevant, $2) }
-    | '..' BId   { (NonStrict, $2) }
+    : BId        { (Relevant empty , $1) }
+    | '.' BId    { (Irrelevant (OIrrDot $ getRange $1), $2) }
+    | '..' BId   { (ShapeIrrelevant (OShIrrDotDot $ getRange $1), $2) }
 -}
 
 
@@ -641,42 +643,66 @@ Expr
                                              Fun (getRange ($1,$2,$3,$4)) dom $4 }
   | Expr1 %prec LOWEST                  { $1 }
 
--- Level 1: Application
+{-
+  Happy supports parameterised rules [1]. We use this to make two variants of expressions: one for
+  expressions at the top-level of a LHS and one that can appear anywhere. At the moment the only
+  thing we rule out in LHSs is record update, to avoid a shift/reduce conflict between `record r
+  where ...` record updates and `record R where` record definitions.
+
+  The way it works is that we parameterise the Expr parsing hierarchy (parameterised rules ending in
+  _P) by the rule for parsing record updates. For top-level LHS we pass in `NoRecordUpdate`, which
+  always fails.
+
+  [1] https://haskell-happy.readthedocs.io/en/latest/syntax.html#parameterized-productions
+-}
+
+NoRecordUpdate :: { Expr }
+NoRecordUpdate : fail { error "impossible" }
+
 Expr1 :: { Expr }
-Expr1
-  : UnnamedWithExprs
+Expr1 : Expr1_P(RecordUpdate) { $1 }
+
+-- Level 1: Application
+-- Expr1 :: { Expr }
+Expr1_P(recordUpdate)
+  : UnnamedWithExprs_P(recordUpdate)
       {% case $1 of
-           { e :| [] -> return e
-           ; e :| es -> return $ WithApp (fuseRange e es) e es
+           { e :| []      -> return e
+           ; e :| e1 : es -> return $ WithApp (getRange (e, e1, es)) e (e1 :| es)
            }
       }
 
 WithExprs :: { List1 (Named Name Expr) }
-WithExprs
-  : Application3 'in' Id     '|' WithExprs { named $3  (rawApp $1) <| $5 }
-  | Application3 {- empty -} '|' WithExprs { unnamed   (rawApp $1) <| $3 }
-  | Application3 'in' Id                   { singleton (named $3 (rawApp $1)) }
-  | Application3 {- empty -}               { singleton (unnamed  (rawApp $1)) }
+WithExprs : WithExprs_P(RecordUpdate) { $1 }
+
+WithExprs_P(recordUpdate)
+  : Application3_P(recordUpdate) 'in' Id '|' WithExprs { named $3  (rawApp $1) <| $5 }
+  | Application3_P(recordUpdate)         '|' WithExprs { unnamed   (rawApp $1) <| $3 }
+  | Application3_P(recordUpdate) 'in' Id               { singleton (named $3 (rawApp $1)) }
+  | Application3_P(recordUpdate)                       { singleton (unnamed  (rawApp $1)) }
 
 UnnamedWithExprs :: { List1 Expr }
-UnnamedWithExprs
-  :  Application3 '|' UnnamedWithExprs { (rawApp $1) <| $3 }
-  | {- empty -} Application            { singleton (rawApp $1) }
+UnnamedWithExprs : UnnamedWithExprs_P(RecordUpdate) { $1 }
+
+UnnamedWithExprs_P(recordUpdate)
+  : Application3_P(recordUpdate) '|' UnnamedWithExprs { (rawApp $1) <| $3 }
+  | Application_P(recordUpdate)                       { singleton (rawApp $1) }
 
 Application :: { List1 Expr }
-Application
-    : Expr2             { singleton $1 }
-    | Expr3 Application { $1 <| $2 }
+Application : Application_P(RecordUpdate) { $1 }
+
+Application_P(recordUpdate)
+    : Expr2_P(recordUpdate)             { singleton $1 }
+    | Expr3_P(recordUpdate) Application { $1 <| $2 }
 
 -- Level 2: Lambdas and lets
-Expr2 :: { Expr }
-Expr2
+Expr2_P(recordUpdate)
     : '\\' LamBindings Expr        { Lam (getRange ($1,$2,$3)) $2 $3 }
     | ExtendedOrAbsurdLam          { $1 }
     | 'forall' ForallBindings Expr { forallPi $2 $3 }
     | 'let' Declarations LetBody   { Let (getRange ($1,$2,$3)) $2 $3 }
     | 'do' vopen DoStmts close     { DoBlock (getRange ($1, $3)) $3 }
-    | Expr3                        { $1 }
+    | Expr3_P(recordUpdate)            { $1 }
     | 'tactic' Application3        { Tactic (getRange ($1, $2)) (rawApp $2) }
 
 LetBody :: { Maybe Expr }
@@ -693,9 +719,11 @@ ExtendedOrAbsurdLam
     | '\\' Attributes1 AbsurdLamBindings                   {% extOrAbsLam (getRange $1) (List1.toList $2) $3 }
 
 Application3 :: { List1 Expr }
-Application3
-    : Expr3              { singleton $1 }
-    | Expr3 Application3 { $1 <| $2 }
+Application3 : Application3_P(RecordUpdate) { $1 }
+
+Application3_P(recordUpdate)
+    : Expr3_P(recordUpdate)              { singleton $1 }
+    | Expr3_P(recordUpdate) Application3 { $1 <| $2 }
 
 -- Christian Sattler, 2017-08-04, issue #2671
 -- We allow empty lists of expressions for the LHS of extended lambda clauses.
@@ -703,8 +731,8 @@ Application3
 -- original type and create this copy solely for extended lambda clauses.
 Application3PossiblyEmpty :: { [Expr] }
 Application3PossiblyEmpty
-    :                                 { [] }
-    | Expr3 Application3PossiblyEmpty { $1 : $2 }
+    : {- empty -}                                     { [] }
+    | Expr3_P(RecordUpdate) Application3PossiblyEmpty { $1 : $2 }
 
 -- Level 3: Atoms
 Expr3Curly :: { Expr }
@@ -715,7 +743,9 @@ Expr3Curly
     | '{{' DoubleCloseBrace       { let r = fuseRange $1 $2 in InstanceArg r $ unnamed $ Absurd r }
 
 Expr3NoCurly :: { Expr }
-Expr3NoCurly
+Expr3NoCurly : Expr3NoCurly_P(RecordUpdate) { $1 }
+
+Expr3NoCurly_P(recordUpdate)
     : '?'                               { QuestionMark (getRange $1) Nothing }
     | '_'                               { Underscore (getRange $1) Nothing }
     | 'quote'                           { Quote (getRange $1) }
@@ -724,13 +754,19 @@ Expr3NoCurly
     | '(|' UnnamedWithExprs '|)'        { IdiomBrackets (getRange ($1,$2,$3)) (List1.toList $2) }
     | '(|)'                             { IdiomBrackets (getRange $1) [] }
     | '(' ')'                           { Absurd (fuseRange $1 $2) }
-    | Id '@' Expr3                      { As (getRange ($1,$2,$3)) $1 $3 }
-    | '.' Expr3                         { Dot (fuseRange $1 $2) $2 }
-    | '..' Expr3                        { DoubleDot (fuseRange $1 $2) $2 }
+    | Id '@' Expr3_P(RecordUpdate)      { As (getRange ($1,$2,$3)) $1 $3 }
+    | '.' Expr3_P(RecordUpdate)         { Dot (kwRange $1) $2 }
+    | '..' Expr3_P(RecordUpdate)        { DoubleDot (kwRange $1) $2 }
     | 'record' '{' RecordAssignments '}' { Rec (getRange ($1,$2,$3,$4)) $3 }
-    | 'record' Expr3NoCurly '{' FieldAssignments '}' { RecUpdate (getRange ($1,$2,$3,$4,$5)) $2 $4 }
+    | 'record' 'where' Declarations0    { RecWhere (getRange ($1,$2,$3)) $3 }
+    | recordUpdate                      { $1 }
     | '...'                             { Ellipsis (getRange $1) }
     | ExprOrAttr                       { $1 }
+
+RecordUpdate :: { Expr }
+RecordUpdate
+    : 'record' Expr3NoCurly '{' FieldAssignments '}' { RecUpdate (getRange ($1,$2,$3,$4,$5)) $2 $4 }
+    | 'record' Expr3NoCurly 'where' Declarations0 { RecUpdateWhere (getRange ($1,$2,$3,$4)) $2 $4 }
 
 -- Level 4: Maybe named, or cubical faces
 Expr4 :: { Expr }
@@ -744,10 +780,13 @@ ExprOrAttr
     | '(' Expr4 ')' { Paren (getRange ($1,$2,$3)) $2 }
     -- ^ this is needed for cubical stuff
 
-Expr3 :: { Expr }
-Expr3
+-- You can't AFAIK make aliases in Happy, and having this rule creates conflicts.
+-- Expr3 :: { Expr }
+-- Expr3 : Expr3_P(RecordUpdate) { $1 }
+
+Expr3_P(recordUpdate)
     : Expr3Curly   { $1 }
-    | Expr3NoCurly { $1 }
+    | Expr3NoCurly_P(recordUpdate) { $1 }
 
 RecordAssignments :: { RecordAssignments }
 RecordAssignments
@@ -805,23 +844,23 @@ TypedBindings
 TypedBinding :: { TypedBinding }
 TypedBinding
     : '.' '(' TBindWithHiding ')'    { setRange (getRange ($2,$3,$4)) $
-                             setRelevance Irrelevant $3 }
+                             makeIrrelevant $1 $3 }
     | '.' '{' TBind '}'    { setRange (getRange ($2,$3,$4)) $
                              setHiding Hidden $
-                             setRelevance Irrelevant $3 }
+                             makeIrrelevant $1 $3 }
     | '.' '{{' TBind DoubleCloseBrace
                            { setRange (getRange ($2,$3,$4)) $
                              makeInstance $
-                             setRelevance Irrelevant $3 }
+                             makeIrrelevant $1 $3 }
     | '..' '(' TBindWithHiding ')'   { setRange (getRange ($2,$3,$4)) $
-                             setRelevance NonStrict $3 }
+                             makeShapeIrrelevant $1 $3 }
     | '..' '{' TBind '}'   { setRange (getRange ($2,$3,$4)) $
                              setHiding Hidden $
-                             setRelevance NonStrict $3 }
+                             makeShapeIrrelevant $1 $3 }
     | '..' '{{' TBind DoubleCloseBrace
                            { setRange (getRange ($2,$3,$4)) $
                              makeInstance $
-                             setRelevance NonStrict $3 }
+                             makeShapeIrrelevant $1 $3 }
     | '(' TBindWithHiding ')'        { setRange (getRange ($1,$2,$3)) $2 }
     | '(' ModalTBindWithHiding ')'        { setRange (getRange ($1,$2,$3)) $2 }
     | '{{' TBind DoubleCloseBrace
@@ -980,15 +1019,15 @@ DomainFreeBinding
 
 MaybeAsPattern :: { Maybe Pattern }
 MaybeAsPattern
-  : '@' Expr3   {% fmap Just (exprToPattern $2) }
+  : '@' Expr3_P(RecordUpdate)   {% fmap Just (exprToPattern $2) }
   | {- empty -} { Nothing }
 
 -- A domain free binding is either x or {x1 .. xn}
 DomainFreeBindingAbsurd :: { Either (List1 (NamedArg Binder)) (List1 Expr)}
 DomainFreeBindingAbsurd
     : BId      MaybeAsPattern { Left . singleton $ mkDomainFree_ id $2 $1 }
-    | '.' BId  MaybeAsPattern { Left . singleton $ mkDomainFree_ (setRelevance Irrelevant) $3 $2 }
-    | '..' BId MaybeAsPattern { Left . singleton $ mkDomainFree_ (setRelevance NonStrict) $3 $2 }
+    | '.' BId  MaybeAsPattern { Left . singleton $ mkDomainFree_ (makeIrrelevant $1) $3 $2 }
+    | '..' BId MaybeAsPattern { Left . singleton $ mkDomainFree_ (makeShapeIrrelevant $1) $3 $2 }
     | '(' Application ')'     {% exprToPattern (rawApp $2) >>= \ p ->
                                  pure . Left . singleton $ mkDomainFree_ id (Just p) $ simpleHole }
     | '(' Attributes1 CommaBIdAndAbsurds ')'
@@ -1003,10 +1042,10 @@ DomainFreeBindingAbsurd
     | '{{' Attributes1 CommaBIds DoubleCloseBrace
          {% applyAttrs1 $2 defaultArgInfo <&> \ ai ->
               Left $ fmap (makeInstance . setTacticAttr $2 . setArgInfo ai) $3 }
-    | '.' '{' CommaBIds '}' { Left $ fmap (hide . setRelevance Irrelevant) $3 }
-    | '.' '{{' CommaBIds DoubleCloseBrace { Left $ fmap (makeInstance . setRelevance Irrelevant) $3 }
-    | '..' '{' CommaBIds '}' { Left $ fmap (hide . setRelevance NonStrict) $3 }
-    | '..' '{{' CommaBIds DoubleCloseBrace { Left $ fmap (makeInstance . setRelevance NonStrict) $3 }
+    | '.' '{' CommaBIds '}' { Left $ fmap (hide . makeIrrelevant $1) $3 }
+    | '.' '{{' CommaBIds DoubleCloseBrace { Left $ fmap (makeInstance . makeIrrelevant $1) $3 }
+    | '..' '{' CommaBIds '}' { Left $ fmap (hide . makeShapeIrrelevant $1) $3 }
+    | '..' '{{' CommaBIds DoubleCloseBrace { Left $ fmap (makeInstance . makeShapeIrrelevant $1) $3 }
 
 
 {--------------------------------------------------------------------------
@@ -1103,7 +1142,7 @@ CommaImportNames1
 -- A left hand side of a function clause. We parse it as an expression, and
 -- then check that it is a valid left hand side.
 LHS :: { [RewriteEqn] -> [WithExpr] -> LHS }
-LHS : Expr1 {% exprToLHS $1 }
+LHS : Expr1_P(NoRecordUpdate) {% exprToLHS $1 }
 
 -- Parsing either an expression @e@ or a @(rewrite | with p <-) e1 | ... | en@.
 HoleContent :: { HoleContent }
@@ -1445,8 +1484,7 @@ Open : MaybeOpen 'import' ModuleName OpenArgs ImportDirective {%
     ; appStm m' es =
         Private empty Inserted
           [ ModuleMacro r defaultErased m'
-             (SectionApp (getRange es) []
-               (rawApp (Ident (QName fresh) :| es)))
+             (SectionApp (getRange es) [] (QName fresh) es)
              doOpen dir
           ]
     ; (initArgs, last2Args) = splitAt (length es - 2) es
@@ -1493,8 +1531,7 @@ Open : MaybeOpen 'import' ModuleName OpenArgs ImportDirective {%
       ; _   -> Private empty Inserted
                  [ ModuleMacro r defaultErased
                      (noName $ beginningOf $ getRange m)
-                     (SectionApp (getRange (m , es)) []
-                        (rawApp (Ident m :| es)))
+                     (SectionApp (getRange (m , es)) [] m es)
                      DoOpen dir
                  ]
       }
@@ -1509,7 +1546,7 @@ Open : MaybeOpen 'import' ModuleName OpenArgs ImportDirective {%
 
 OpenArgs :: { [Expr] }
 OpenArgs : {- empty -}    { [] }
-         | Expr3 OpenArgs { $1 : $2 }
+         | Expr3_P(RecordUpdate) OpenArgs { $1 : $2 }
 
 ModuleApplication :: { Telescope -> Parser ModuleApplication }
 ModuleApplication : ModuleName '{{' '...' DoubleCloseBrace { (\ts ->
@@ -1517,7 +1554,7 @@ ModuleApplication : ModuleName '{{' '...' DoubleCloseBrace { (\ts ->
                     else parseError "No bindings allowed for record module with non-canonical implicits" )
                     }
                   | ModuleName OpenArgs {
-                    (\ts -> return $ SectionApp (getRange ($1, $2)) ts (rawApp (Ident $1 :| $2)) ) }
+                    (\ts -> return $ SectionApp (getRange ($1, $2)) ts $1 $2) }
 
 
 -- Module instantiation
@@ -1617,13 +1654,13 @@ ForeignPragma :: { Pragma }
 ForeignPragma
   : '{-#' 'FOREIGN' string ForeignCode '#-}'
     { ForeignPragma (getRange ($1, $2, fst $3, $5))
-        (mkRString $3) (recoverLayout (DL.toList $4)) }
+        (mkRText $3) (recoverLayout (DL.toList $4)) }
 
 CompilePragma :: { Pragma }
 CompilePragma
   : '{-#' 'COMPILE' string PragmaQName PragmaStrings '#-}'
     { CompilePragma (getRange ($1, $2, fst $3, $4, map fst $5, $6))
-        (mkRString $3) $4 (unwords (map snd $5)) }
+        (mkRText $3) $4 (unwords (map snd $5)) }
 
 StaticPragma :: { Pragma }
 StaticPragma
@@ -1783,12 +1820,11 @@ ArgTypeSignatures0
     | {- empty -}                         { [] }
 
 -- Record declarations, including an optional record constructor name.
-RecordDeclarations :: { (RecordDirectives, [Declaration]) }
+RecordDeclarations :: { ([RecordDirective], [Declaration]) }
 RecordDeclarations
-    : vopen RecordDirectives close                    {% verifyRecordDirectives $2 <&> (,[]) }
-    | vopen RecordDirectives semi Declarations1 close {% verifyRecordDirectives $2 <&> (, List1.toList $4) }
-    | vopen Declarations1 close                       { (emptyRecordDirectives, List1.toList $2) }
-
+    : vopen RecordDirectives close                    { (reverse $2, []) }
+    | vopen RecordDirectives semi Declarations1 close { (reverse $2, List1.toList $4) }
+    | vopen Declarations1 close                       { ([], List1.toList $2) }
 
 RecordDirectives :: { [RecordDirective] }
 RecordDirectives
@@ -1890,7 +1926,7 @@ parseDisplayPragma r pos s =
 
 -- | Required by Happy.
 happyError :: Parser a
-happyError = parseError "Parse error"
+happyError = parseError ""
 
 
 {--------------------------------------------------------------------------

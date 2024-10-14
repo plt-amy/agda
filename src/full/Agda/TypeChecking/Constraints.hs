@@ -6,14 +6,14 @@ module Agda.TypeChecking.Constraints where
 
 import Prelude hiding (null)
 
-import Control.Monad
-import Control.Monad.Except
+import Control.Monad.Except ( MonadError )
 
 import qualified Data.List as List
 import qualified Data.Set as Set
 import Data.Either
 
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty ( prettyShow )
 import Agda.Syntax.Internal
 
 import Agda.TypeChecking.Monad
@@ -37,11 +37,12 @@ import {-# SOURCE #-} Agda.TypeChecking.Lock
 import {-# SOURCE #-} Agda.TypeChecking.CheckInternal ( checkType )
 
 import Agda.Utils.CallStack ( withCurrentCallStack )
+import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
-import Agda.Utils.Null
-import Agda.Syntax.Common.Pretty (prettyShow)
+import Agda.Utils.Null ()
 import qualified Agda.Utils.ProfileOptions as Profile
+import Agda.Utils.Singleton
 
 import Agda.Utils.Impossible
 
@@ -96,13 +97,13 @@ addConstraintTCM unblock c = do
           -- Get all level constraints.
           lvlcs <- instantiateFull =<< do
             List.filter (isLvl . clValue) . map theConstraint <$> getAllConstraints
-          unless (null lvlcs) $ do
+          List1.ifNull lvlcs (return Nothing) $ {-else-} \ lvlcs -> do
             reportSDoc "tc.constr.lvl" 40 $ vcat
               [ "simplifying level constraint" <+> prettyTCM c
               , nest 2 $ hang "using" 2 $ prettyTCM lvlcs
               ]
-          -- Try to simplify @c@ using the other constraints.
-          return $ simplifyLevelConstraint c $ map clValue lvlcs
+            -- Try to simplify @c@ using the other constraints.
+            return $ simplifyLevelConstraint c $ fmap clValue lvlcs
         | otherwise = return Nothing
 
 wakeConstraintsTCM :: (ProblemConstraint-> WakeUp) -> TCM ()
@@ -158,11 +159,11 @@ noConstraints' includingNonBlocking problem = do
   (pid, x) <- newProblem problem
   let counts | includingNonBlocking = const True
              | otherwise            = isBlockingConstraint . clValue . theConstraint
-  cs <- filter counts <$> getConstraintsForProblem pid
-  unless (null cs) $ do
-    withCurrentCallStack $ \loc -> do
-      w <- warning'_ loc (UnsolvedConstraints cs)
-      typeError' loc $ NonFatalErrors [ w ]
+  cs <- List.filter counts <$> getConstraintsForProblem pid
+  List1.ifNull cs (pure ()) \ cs -> do
+    withCurrentCallStack \ loc -> do
+      w <- warning'_ loc $ UnsolvedConstraints cs
+      typeError' loc $ NonFatalErrors $ singleton w
   return x
 
 -- | Run a computation that should succeeds without constraining
@@ -227,7 +228,7 @@ wakeupConstraints x = do
 
 -- | Wake up all constraints not blocked on a problem.
 wakeupConstraints_ :: TCM ()
-wakeupConstraints_ = locallyTCState stMutualChecks (const True) do
+wakeupConstraints_ = do
   wakeConstraints' (wakeup . constraintUnblocker)
   solveAwakeConstraints
   where

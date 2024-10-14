@@ -1,9 +1,8 @@
 {-# LANGUAGE CPP                  #-}
-{-# LANGUAGE TypeOperators        #-}
 {-# LANGUAGE DataKinds            #-}
-{-# LANGUAGE UndecidableInstances #-} -- Due to ICODE vararg typeclass
 {-# LANGUAGE MagicHash            #-}
 {-# LANGUAGE UnboxedTuples        #-}
+{-# LANGUAGE UndecidableInstances #-} -- Due to ICODE vararg typeclass
 
 {-
 András, 2023-10-2:
@@ -44,13 +43,14 @@ import Unsafe.Coerce
 
 import Agda.Syntax.Common (NameId)
 import Agda.Syntax.Internal (Term, QName(..), ModuleName(..), nameId)
-import Agda.TypeChecking.Monad.Base (TypeError(GenericError), ModuleToSource)
+import Agda.TypeChecking.Monad.Base (ModuleToSource)
 
 import Agda.Utils.FileName
 import Agda.Utils.HashTable (HashTable)
 import qualified Agda.Utils.HashTable as H
 import Agda.Utils.IORef
 import Agda.Utils.Lens
+import Agda.Utils.List1 (List1)
 import Agda.Utils.Monad
 import Agda.Utils.Pointer
 import Agda.Utils.TypeLevel
@@ -232,7 +232,7 @@ data St = St
     --   Used to introduce sharing while deserializing objects.
   , modFile   :: !ModuleToSource
     -- ^ Maps module names to file names. Constructed by the decoder.
-  , includes  :: ![AbsolutePath]
+  , includes  :: !(List1 AbsolutePath)
     -- ^ The include directories.
   }
 

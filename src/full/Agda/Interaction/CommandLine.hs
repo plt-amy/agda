@@ -36,7 +36,6 @@ import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Errors
 import Agda.TypeChecking.Pretty ( PrettyTCM(prettyTCM) )
 import Agda.TypeChecking.Substitute
-import Agda.TypeChecking.Warnings (runPM)
 
 import Agda.Utils.FileName (absolute, AbsolutePath)
 import Agda.Utils.Maybe (caseMaybeM)
@@ -351,5 +350,4 @@ help cs = putStr $ unlines $
 readM :: Read a => String -> TCM a
 readM s = maybe err return $ readMaybe s
   where
-  err    = throwError $ strMsg $ "Cannot parse: " ++ s
-  strMsg = Exception noRange . text
+  err = throwError $ GenericException $ "Cannot parse: " ++ s

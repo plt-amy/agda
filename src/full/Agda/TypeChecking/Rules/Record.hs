@@ -6,7 +6,6 @@ module Agda.TypeChecking.Rules.Record where
 
 import Prelude hiding (null, not, (&&), (||))
 
-import Control.Monad
 import Data.Maybe
 import qualified Data.Set as Set
 
@@ -48,7 +47,6 @@ import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Null
 import Agda.Utils.POMonoid
-import Agda.Syntax.Common.Pretty (render)
 import qualified Agda.Syntax.Common.Pretty as P
 import Agda.Utils.Size
 
@@ -156,15 +154,8 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
 
       -- Obtain name of constructor (if present).
       (hasNamedCon, conName) <- case con of
-        Just c  -> return (True, c)
-        Nothing -> do
-          m <- killRange <$> currentModule
-          -- Andreas, 2020-06-01, AIM XXXII
-          -- Using prettyTCM here jinxes the printer, see PR #4699.
-          -- r <- prettyTCM name
-          let r = P.pretty $ qnameName name
-          c <- qualify m <$> freshName_ (render r ++ ".constructor")
-          return (False, c)
+        A.NamedRecCon c -> return (True, c)
+        A.FreshRecCon c -> return (False, c)
 
       -- Add record type to signature.
       reportSDoc "tc.rec" 15 $ "adding record type to signature"
@@ -188,27 +179,29 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
           -- Andreas, 2016-09-20, issue #2197.
           -- Eta is inferred by the positivity checker.
           -- We should turn it off until it is proven to be safe.
-          haveEta      = maybe (Inferred $ NoEta patCopat) Specified eta
-          -- haveEta      = maybe (Inferred $ conInduction == Inductive && etaenabled) Specified eta
+          noEta    = Inferred $ NoEta patCopat
+          haveEta0 = maybe noEta Specified eta
           con = ConHead conName (IsRecord patCopat) conInduction $ map argFromDom fs
 
           -- A record is irrelevant if all of its fields are.
           -- In this case, the associated module parameter will be irrelevant.
-          -- See issue 392.
+          -- See issue #392.
           -- Unless it's been declared coinductive or no-eta-equality (#2607).
           recordRelevance
-            | Just NoEta{} <- eta         = Relevant
-            | CoInductive <- conInduction = Relevant
-            | otherwise                   = minimum $ Irrelevant : map getRelevance (telToList ftel)
+            | Just NoEta{} <- eta         = relevant
+            | CoInductive <- conInduction = relevant
+            | null (telToList ftel)       = relevant    -- #6270: eta unit types don't need to be irrelevant
+            | otherwise                   = minimum $ irrelevant : map getRelevance (telToList ftel)
 
       -- Andreas, 2017-01-26, issue #2436
       -- Disallow coinductive records with eta-equality
-      when (conInduction == CoInductive && theEtaEquality haveEta == YesEta) $ do
-        typeError . GenericDocError =<< do
-          sep [ "Agda doesn't like coinductive records with eta-equality."
-              , "If you must, use pragma"
-              , "{-# ETA" <+> prettyTCM name <+> "#-}"
-              ]
+      -- Andreas, 2024-06-14, PR #7300
+      -- Just make this a deadcode warning.
+      haveEta <-
+        if (conInduction == CoInductive && theEtaEquality haveEta0 == YesEta) then do
+          noEta <$ do
+            setCurrentRange eta0 $ warning $ CoinductiveEtaRecord name
+        else pure haveEta0
       reportSDoc "tc.rec" 30 $ "record constructor is " <+> prettyTCM con
 
       -- Jesper, 2021-05-26: Warn when declaring coinductive record
@@ -227,7 +220,7 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
       let npars = size tel
           telh  = fmap hideAndRelParams tel
       escapeContext impossible npars $ do
-        addConstant' name defaultArgInfo name t $
+        addConstant' name defaultArgInfo t $
             Record
               { recPars           = npars
               , recClause         = Nothing
@@ -250,7 +243,7 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
 
         erasure <- optErasure <$> pragmaOptions
         -- Add record constructor to signature
-        addConstant' conName defaultArgInfo conName
+        addConstant' conName defaultArgInfo
              -- If --erasure is used, then the parameters are erased
              -- in the constructor's type.
             (applyWhen erasure (fmap $ applyQuantity zeroQuantity) telh
@@ -391,7 +384,7 @@ checkRecDef i name uc (RecordDirectives ind eta0 pat con) (A.DataDefParams gpars
   -- then switch on pattern matching for no-eta-equality.
   -- Default is no pattern matching, but definition by copatterns instead.
   patCopat = maybe CopatternMatching (const PatternMatching) pat
-  eta      = (patCopat <$) <$> eta0
+  eta      = ((patCopat <$) . rangedThing) <$> eta0
 
 
 addCompositionForRecord
@@ -500,7 +493,7 @@ defineKanOperationR cmd name params fsT fns rect = do
                   -- Γ = Δ, CompRArgs
                   -- pats = ... | phi = i1
                   -- body = u i1 itIsOne
-                  DoHComp  -> (2,Var 1 [] `apply` [argN io, setRelevance Irrelevant $ argN one])
+                  DoHComp  -> (2,Var 1 [] `apply` [argN io, setRelevance irrelevant $ argN one])
 
               p = ConP (ConHead io_name IsData Inductive [])
                        (noConPatternInfo { conPType = Just (Arg defaultArgInfo tInterval)
@@ -530,7 +523,6 @@ defineKanOperationR cmd name params fsT fns rect = do
                          , clauseBody      = Just $ rhs
                          , clauseType      = Just $ argN t
                          , clauseCatchall    = False
-                         , clauseExact       = Just True
                          , clauseRecursive   = Just False  -- definitely non-recursive!
                          , clauseUnreachable = Just False
                          , clauseEllipsis    = NoEllipsis
@@ -548,7 +540,6 @@ defineKanOperationR cmd name params fsT fns rect = do
                          , clauseBody      = Just body
                          , clauseType      = Just $ argN (unDom clause_ty)
                          , clauseCatchall    = False
-                         , clauseExact       = Just True
                          , clauseRecursive   = Nothing
                              -- Andreas 2020-02-06 TODO
                              -- Or: Just False;  is it known to be non-recursive?
@@ -700,10 +691,7 @@ checkRecordProjections m r hasNamedCon con tel ftel fs = do
         -- 2012-04-02: DontCare instead of irrAxiom
 
         -- compute body modification for irrelevant projections
-        let bodyMod = case rel of
-              Relevant   -> id
-              NonStrict  -> id
-              Irrelevant -> dontCare
+        let bodyMod = applyWhen (isIrrelevant rel) dontCare
 
         let -- Andreas, 2010-09-09: comment for existing code
             -- split the telescope into parameters (ptel) and the type or the record
@@ -728,7 +716,6 @@ checkRecordProjections m r hasNamedCon con tel ftel fs = do
                             , clauseBody      = body
                             , clauseType      = cltype
                             , clauseCatchall  = False
-                            , clauseExact       = Just True
                             , clauseRecursive   = Just False
                             , clauseUnreachable = Just False
                             , clauseEllipsis    = NoEllipsis

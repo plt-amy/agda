@@ -13,7 +13,6 @@ import Data.Kind ( Type )
 import qualified Data.List as List
 import Data.Maybe
 import qualified Data.Strict.Maybe as Strict
-import Data.Set (Set)
 
 import Agda.Syntax.Position
 import qualified Agda.Syntax.Abstract.Name as A
@@ -27,6 +26,7 @@ import Agda.Syntax.Common.Pretty
 import Agda.Utils.List  ( spanEnd )
 import Agda.Utils.List1 ( List1, pattern (:|), (<|) )
 import qualified Agda.Utils.List1 as List1
+import Agda.Utils.Set1  ( Set1 )
 import Agda.Utils.Singleton
 
 import Agda.Utils.Impossible
@@ -56,7 +56,7 @@ data ExprView e
     | WildV e
     | OtherV e
     | AppV e (NamedArg e)
-    | OpAppV QName (Set A.Name) (OpAppArgs' e)
+    | OpAppV QName (Set1 A.Name) (OpAppArgs' e)
       -- ^ The 'QName' is possibly ambiguous, but it must correspond
       -- to one of the names in the set.
     | HiddenArgV (Named_ e)
@@ -111,7 +111,7 @@ instance IsExpr Pattern where
     unExprView = \case
         LocalV x       -> IdentP True x
         AppV e1 e2     -> AppP e1 e2
-        OpAppV d ns es -> let ess :: [NamedArg Pattern]
+        OpAppV d ns es -> let ess :: List1 (NamedArg Pattern)
                               ess = (fmap . fmap . fmap)
                                       (\case
                                           Placeholder{}     -> __IMPOSSIBLE__
@@ -267,9 +267,11 @@ opP parseSections p (NewNotation q names _ syn isOp) kind =
           -- away here.
           unExprView (LocalV q')
         else
-          unExprView (OpAppV q' names args)
+          List1.ifNull args
+            {-then-} (unExprView $ LocalV q')
+            {-else-} $ unExprView . OpAppV q' names
         where
-        args = map (findExprFor (f normal) binders) [0..lastHole]
+        args = fmap (findExprFor (f normal) binders) [0..lastHole]
         q'   = setRange range q
   in
 
@@ -343,7 +345,7 @@ opP parseSections p (NewNotation q names _ syn isOp) kind =
         {-else-} $ \ bs -> set (noPlaceholder (SyntaxBindingLambda (fuseRange bs e) bs e)) arg
       _ -> __IMPOSSIBLE__
 
-  noPlaceholders :: OpAppArgs' e -> Int
+  noPlaceholders :: OpAppArgs0 e -> Int
   noPlaceholders = sum . fmap (isPlaceholder . namedArg)
     where
     isPlaceholder NoPlaceholder{} = 0

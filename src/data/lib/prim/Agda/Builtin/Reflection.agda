@@ -247,7 +247,7 @@ data Definition : Set where
   function    : (cs : List Clause) → Definition
   data-type   : (pars : Nat) (cs : List Name) → Definition
   record-type : (c : Name) (fs : List (Arg Name)) → Definition
-  data-cons   : (d : Name) → Definition
+  data-cons   : (d : Name) (q : Quantity) → Definition
   axiom       : Definition
   prim-fun    : Definition
 
@@ -296,7 +296,7 @@ postulate
   declareDef       : Arg Name → Type → TC ⊤
   declarePostulate : Arg Name → Type → TC ⊤
   declareData      : Name → Nat → Type → TC ⊤
-  defineData       : Name → List (Σ Name (λ _ → Type)) → TC ⊤
+  defineData       : Name → List (Σ Name (λ _ → Σ Quantity (λ _ → Type))) → TC ⊤
   defineFun        : Name → List Clause → TC ⊤
   getType          : Name → TC Type
   getDefinition    : Name → TC Definition
@@ -334,6 +334,9 @@ postulate
   -- "blocking" constraints.
   noConstraints : ∀ {a} {A : Set a} → TC A → TC A
 
+  -- Run the given computation at the type level, allowing use of erased things.
+  workOnTypes : ∀ {a} {A : Set a} → TC A → TC A
+
   -- Run the given TC action and return the first component. Resets to
   -- the old TC state if the second component is 'false', or keep the
   -- new TC state if it is 'true'.
@@ -348,6 +351,10 @@ postulate
   -- from the current macro invokation. Outside constraints are still attempted,
   -- but failure to solve them are ignored by `noConstraints`.
   solveInstanceConstraints : TC ⊤
+
+  -- Parse and type check the given string against the given type, returning
+  -- the resulting term (when successful).
+  checkFromStringTC : String → Type → TC Term
 
 {-# BUILTIN AGDATCM                           TC                         #-}
 {-# BUILTIN AGDATCMRETURN                     returnTC                   #-}
@@ -389,9 +396,11 @@ postulate
 {-# BUILTIN AGDATCMFORMATERRORPARTS           formatErrorParts           #-}
 {-# BUILTIN AGDATCMDEBUGPRINT                 debugPrint                 #-}
 {-# BUILTIN AGDATCMNOCONSTRAINTS              noConstraints              #-}
+{-# BUILTIN AGDATCMWORKONTYPES                workOnTypes                #-}
 {-# BUILTIN AGDATCMRUNSPECULATIVE             runSpeculative             #-}
 {-# BUILTIN AGDATCMGETINSTANCES               getInstances               #-}
 {-# BUILTIN AGDATCMSOLVEINSTANCES             solveInstanceConstraints   #-}
+{-# BUILTIN AGDATCMCHECKFROMSTRING            checkFromStringTC          #-}
 
 -- All the TC primitives are compiled to functions that return
 -- undefined, rather than just undefined, in an attempt to make sure

@@ -325,7 +325,8 @@ below <reflection-tc-monad>`.
     data-type   : (pars : Nat) (cs : List Name) → Definition  -- parameters and constructors
     record-type : (c : Name) (fs : List (Arg Name)) →         -- c: name of record constructor
                   Definition                                  -- fs: fields
-    data-cons   : (d : Name) → Definition                     -- d: name of data type
+    data-cons   : (d : Name) (q : Quantity) → Definition      -- d: name of data type
+                                                              -- q: constructor quantity
     axiom       : Definition
     prim-fun    : Definition
 
@@ -477,9 +478,9 @@ following primitive operations::
     declareData      : Name → Nat → Type → TC ⊤
 
     -- Define a declared datatype. The datatype must have been declared using
-    -- 'declareData`. The second argument is a list of pairs in which each pair
-    -- is the name of a constructor and its type.
-    defineData       : Name → List (Σ Name (λ _ → Type)) → TC ⊤
+    -- 'declareData`. The second argument is a list of triples in which each triple
+    -- is the name of a constructor, its erasure status and its type.
+    defineData       : Name → List (Σ Name (λ _ → Σ Quantity (λ _ → Type))) → TC ⊤
 
     -- Define a declared function. The function may have been declared using
     -- 'declareDef' or with an explicit type signature in the program.
@@ -522,6 +523,10 @@ following primitive operations::
     withReduceDefs : ∀ {a} {A : Set a} → (Σ Bool λ _ → List Name) → TC A → TC A
     askReduceDefs  : TC (Σ Bool λ _ → List Name)
 
+    -- Parse and type check the given string against the given type, returning
+    -- the resulting term (when successful).
+    checkFromStringTC : String → Type → TC Term
+
     -- Prints the third argument to the debug buffer in Emacs
     -- if the verbosity level (set by the -v flag to Agda)
     -- is higher than the second argument. Note that Level 0 and 1 are printed
@@ -535,6 +540,9 @@ following primitive operations::
     -- Fail if the given computation gives rise to new, unsolved
     -- "blocking" constraints.
     noConstraints : ∀ {a} {A : Set a} → TC A → TC A
+
+    -- Run the given computation at the type level, allowing use of erased things.
+    workOnTypes : ∀ {a} {A : Set a} → TC A → TC A
 
     -- Run the given TC action and return the first component. Resets to
     -- the old TC state if the second component is 'false', or keep the
@@ -587,6 +595,7 @@ following primitive operations::
   {-# BUILTIN AGDATCMASKREDUCEDEFS              askReduceDefs              #-}
   {-# BUILTIN AGDATCMDEBUGPRINT                 debugPrint                 #-}
   {-# BUILTIN AGDATCMNOCONSTRAINTS              noConstraints              #-}
+  {-# BUILTIN AGDATCMWORKONTYPES                workOnTypes                #-}
   {-# BUILTIN AGDATCMRUNSPECULATIVE             runSpeculative             #-}
   {-# BUILTIN AGDATCMGETINSTANCES               getInstances               #-}
   {-# BUILTIN AGDATCMSOLVEINSTANCES             solveInstanceConstraints   #-}

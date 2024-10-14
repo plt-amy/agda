@@ -15,9 +15,8 @@
 
 module Agda.TypeChecking.MetaVars.Occurs where
 
-import Control.Monad
-import Control.Monad.Except
-import Control.Monad.Reader
+import Control.Monad.Except ( ExceptT, runExceptT, catchError, throwError )
+import Control.Monad.Reader ( ReaderT, runReaderT, ask, asks, local )
 
 import Data.Foldable (traverse_)
 import Data.Functor
@@ -139,8 +138,9 @@ tallyDef d = modifyOccursCheckDefs $ Set.delete d
 -- | Extra environment for the occurs check.  (Complements 'FreeEnv'.)
 data OccursExtra = OccursExtra
   { occUnfold  :: UnfoldStrategy
-  , occVars    :: VarMap          -- ^ The allowed variables with their variance.
-  , occMeta    :: MetaId          -- ^ The meta we want to solve.
+  , occMeta    :: MetaId          -- ^ The meta @m@ we want to solve.
+  , occVars    :: VarMap          -- ^ The allowed variables @xs@ with their variance.
+  , occRHS     :: Term            -- ^ The proposed solution @v@ for the meta (@m xs := v@).
   , occCxtSize :: Nat             -- ^ The size of the typing context upon invocation.
   }
 
@@ -197,7 +197,7 @@ definitionCheck d = do
         , "has relevance"
         , text . show $ getRelevance dmod
         ]
-      abort neverUnblock $ MetaIrrelevantSolution m $ Def d []
+      abort neverUnblock $ MetaIrrelevantSolution m $ occRHS $ feExtra cxt
     unless (er || usableQuantity dmod) $ do
       reportSDoc "tc.meta.occurs" 35 $ hsep
         [ "occursCheck: definition"
@@ -205,7 +205,7 @@ definitionCheck d = do
         , "has quantity"
         , text . show $ getQuantity dmod
         ]
-      abort neverUnblock $ MetaErasedSolution m $ Def d []
+      abort neverUnblock $ MetaErasedSolution m $ occRHS $ feExtra cxt
 
 metaCheck :: MetaId -> OccursM MetaId
 metaCheck m = do
@@ -228,6 +228,7 @@ metaCheck m = do
   -- WAS:
   -- when (m == m') $ if ctx == Top then patternViolation else
   --   abort ctx $ MetaOccursInItself m'
+  -- Andreas, 2024-09-28: removed error MetaOccursInItself from code base.
   when (m == m0) $ patternViolation' neverUnblock 50 $ "occursCheck failed: Found " ++ prettyShow m
 
   mv <- lookupLocalMeta m
@@ -386,10 +387,11 @@ occursCheck m xs v = Bench.billTo [ Bench.Typing, Bench.OccursCheck ] $ do
   n  <- getContextSize
   reportSDoc "tc.meta.occurs" 65 $ "occursCheck" <+> pretty m <+> text (show xs)
   let initEnv unf = FreeEnv
-        {  feExtra = OccursExtra
+        { feExtra = OccursExtra
           { occUnfold  = unf
-          , occVars    = xs
           , occMeta    = m
+          , occVars    = xs
+          , occRHS     = v
           , occCxtSize = n
           }
         , feFlexRig   = StronglyRigid -- ? Unguarded
@@ -397,7 +399,7 @@ occursCheck m xs v = Bench.billTo [ Bench.Typing, Bench.OccursCheck ] $ do
         , feSingleton = variableCheck xs
         }
   initOccursCheck mv
-  nicerErrorMessage $ do
+  do
     -- First try without normalising the term
     (occurs v `runReaderT` initEnv NoUnfold) `catchError` \err -> do
       -- If first run is inconclusive, try again with normalization
@@ -408,57 +410,6 @@ occursCheck m xs v = Bench.billTo [ Bench.Typing, Bench.OccursCheck ] $ do
           initOccursCheck mv
           occurs v `runReaderT` initEnv YesUnfold
         _ -> throwError err
-
-  where
-    -- Produce nicer error messages
-    nicerErrorMessage :: TCM a -> TCM a
-    nicerErrorMessage f = f `catchError` \ err -> case err of
-      TypeError _ _ cl -> case clValue cl of
-        MetaOccursInItself{} ->
-          typeError . GenericDocError =<<
-            fsep [ text "Refuse to construct infinite term by instantiating"
-                 , prettyTCM m
-                 , "to"
-                 , prettyTCM =<< instantiateFull v
-                 ]
-        MetaCannotDependOn _ i ->
-          ifM (isSortMeta m `and2M` (not <$> hasUniversePolymorphism))
-          ( typeError . GenericDocError =<<
-            fsep [ text "Cannot instantiate the metavariable"
-                 , prettyTCM m
-                 , "to"
-                 , prettyTCM v
-                 , "since universe polymorphism is disabled"
-                 ]
-          ) {- else -}
-          ( typeError . GenericDocError =<<
-              fsep [ text "Cannot instantiate the metavariable"
-                   , prettyTCM m
-                   , "to solution"
-                   , prettyTCM v
-                   , "since it contains the variable"
-                   , enterClosure cl $ \_ -> prettyTCM (Var i [])
-                   , "which is not in scope of the metavariable"
-                   ]
-            )
-        MetaIrrelevantSolution _ _ ->
-          typeError . GenericDocError =<<
-            fsep [ text "Cannot instantiate the metavariable"
-                 , prettyTCM m
-                 , "to solution"
-                 , prettyTCM v
-                 , "since (part of) the solution was created in an irrelevant context"
-                 ]
-        MetaErasedSolution _ _ ->
-          typeError . GenericDocError =<<
-            fsep [ text "Cannot instantiate the metavariable"
-                 , prettyTCM m
-                 , "to solution"
-                 , prettyTCM v
-                 , "since (part of) the solution was created in an erased context"
-                 ]
-        _ -> throwError err
-      _ -> throwError err
 
 instance Occurs Term where
   occurs v = do
@@ -501,7 +452,7 @@ instance Occurs Term where
                   -- could potentially be salvaged by eta expansion.
                   ifM (($ i) <$> allowedVars) -- vv TODO: neverUnblock is not correct! What could trigger this eta expansion though?
                       (patternViolation' neverUnblock 70 $ "Disallowed var " ++ show i ++ " due to modality/relevance")
-                      (strongly $ abort neverUnblock $ MetaCannotDependOn m i)
+                      (strongly $ abort neverUnblock $ MetaCannotDependOn m (occRHS $ feExtra ctx) i)
                 -- is a singleton type with unique inhabitant sv
                 (Just sv) -> return $ sv `applyE` es
           Lam h f     -> do
@@ -510,7 +461,7 @@ instance Occurs Term where
           Lit l       -> return v
           Dummy{}     -> return v
           DontCare v  -> dontCare <$> do
-            onlyReduceTypes $ underRelevance Irrelevant $ occurs v
+            onlyReduceTypes $ underRelevance irrelevant $ occurs v
           Def d es    -> do
             definitionCheck d
             Def d <$> occDef d es
@@ -518,7 +469,7 @@ instance Occurs Term where
             definitionCheck (conName c)
             Con c ci <$> conArgs vs (occurs vs)  -- if strongly rigid, remain so, except with unreduced IApply arguments.
           Pi a b      -> Pi <$> occurs_ a <*> occurs b
-          Sort s      -> Sort <$> do underRelevance NonStrict $ occurs_ s
+          Sort s      -> Sort <$> do underRelevance shapeIrrelevant $ occurs_ s
           MetaV m' es -> do
             m' <- metaCheck m'
             -- The arguments of a meta are in a flexible position
@@ -911,12 +862,11 @@ instance (Subst a, AnyRigid a) => AnyRigid (Abs a) where
 
 instance AnyRigid a => AnyRigid (Arg a) where
   anyRigid f a =
-    case getRelevance a of
       -- Irrelevant arguments are definitionally equal to
       -- values, so the variables there are not considered
       -- "definitely rigid".
-      Irrelevant -> return False
-      _          -> anyRigid f $ unArg a
+    if isIrrelevant a then return False else
+      anyRigid f $ unArg a
 
 instance AnyRigid a => AnyRigid (Dom a) where
   anyRigid f dom = anyRigid f $ unDom dom

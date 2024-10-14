@@ -18,21 +18,23 @@ module Agda.TypeChecking.Coverage
 
 import Prelude hiding (null, (!!))  -- do not use partial functions like !!
 
-import Control.Monad
-import Control.Monad.Except
-import Control.Monad.Trans ( lift )
+import Control.Monad.Except ( MonadError(..), ExceptT(..), runExceptT )
+import Control.Monad.State  ( State, evalState, state )
 
 import Data.Foldable (for_)
+import Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
+import Data.IntSet (IntSet)
+import qualified Data.IntSet as IntSet
 import qualified Data.List as List
 import Data.Map (Map)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import Data.IntSet (IntSet)
-import qualified Data.IntSet as IntSet
 
 import qualified Agda.Benchmarking as Bench
 
 import Agda.Syntax.Common
+import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Syntax.Position
 import Agda.Syntax.Internal hiding (DataOrRecord)
 import Agda.Syntax.Internal.Pattern
@@ -52,7 +54,6 @@ import Agda.TypeChecking.Coverage.SplitTree
 import Agda.TypeChecking.Coverage.SplitClause
 import Agda.TypeChecking.Coverage.Cubical
 
-
 import Agda.TypeChecking.Conversion (tryConversion, equalType)
 import Agda.TypeChecking.Datatypes (getConForm)
 import {-# SOURCE #-} Agda.TypeChecking.Empty ( checkEmptyTel, isEmptyTel, isEmptyType )
@@ -61,6 +62,7 @@ import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Substitute
 import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Records
+import Agda.TypeChecking.Sort
 import Agda.TypeChecking.Telescope
 import Agda.TypeChecking.MetaVars
 import Agda.TypeChecking.Warnings
@@ -71,20 +73,17 @@ import Agda.Utils.Either
 import Agda.Utils.Function
 import Agda.Utils.Functor
 import Agda.Utils.List
+import Agda.Utils.Lens
+import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Maybe
 import Agda.Utils.Monad
 import Agda.Utils.Null
 import Agda.Utils.Permutation
-import Agda.Syntax.Common.Pretty (prettyShow)
 import Agda.Utils.Singleton
 import Agda.Utils.Size
 import Agda.Utils.Tuple
 
 import Agda.Utils.Impossible
-import Data.IntMap (IntMap)
-import qualified Data.IntMap as IntMap
-import Control.Monad.State
-
 
 type CoverM = ExceptT SplitError TCM
 
@@ -189,7 +188,6 @@ coverageCheck f t cs = do
                       , clauseBody      = Nothing
                       , clauseType      = Nothing
                       , clauseCatchall    = True       -- absurd clauses are safe as catch-all
-                      , clauseExact       = Just False
                       , clauseRecursive   = Just False
                       , clauseUnreachable = Just False
                       , clauseEllipsis    = NoEllipsis
@@ -208,36 +206,25 @@ coverageCheck f t cs = do
       return False
 
   -- report a warning if there are uncovered cases,
-  unless (null pss) $ do
+  List1.unlessNull pss \ pss -> do
     stLocalPartialDefs `modifyTCLens` Set.insert f
     whenM ((YesCoverageCheck ==) <$> viewTC eCoverageCheck) $
       setCurrentRange cs $ warning $ CoverageIssue f pss
 
   -- Andreas, 2017-08-28, issue #2723:
   -- Mark clauses as reachable or unreachable in the signature.
-  -- Andreas, 2020-11-19, issue #5065
-  -- Remember whether clauses are exact or not.
-  let (is0, cs1) = unzip $ for (zip [0..] cs) $ \ (i, cl) -> let
-          unreachable = i `IntSet.notMember` used
-          exact       = i `IntSet.notMember` (IntSet.fromList noex)
-        in (boolToMaybe unreachable i, cl
-             { clauseUnreachable = Just unreachable
-             , clauseExact       = Just exact
-             })
-  -- is = indices of unreachable clauses
-  let is = catMaybes is0
-  reportSDoc "tc.cover.top" 10 $ vcat
-    [ text $ "unreachable clauses: " ++ if null is then "(none)" else show is
-    ]
+  let cs1 = zip [0..] cs <&> \ (i, cl) -> cl
+             { clauseUnreachable = Just $ i `IntSet.notMember` used
+             }
+
   -- Replace the first clauses by @cs1@.  There might be more
   -- added by @inferMissingClause@.
   modifyFunClauses f $ \ cs0 -> cs1 ++ drop (length cs1) cs0
 
   -- Warn if there are unreachable clauses and mark them as unreachable.
-  unless (null is) $ do
+  List1.unlessNull (filter ((Just True ==) . clauseUnreachable) cs1) \ unreached -> do
     -- Warn about unreachable clauses.
-    let unreached = filter ((Just True ==) . clauseUnreachable) cs1
-    let ranges    = map clauseFullRange unreached
+    let ranges = fmap clauseFullRange unreached
     setCurrentRange ranges $ warning $ UnreachableClauses f ranges
 
   -- Report a warning if there are clauses that are not preserved as
@@ -246,9 +233,9 @@ coverageCheck f t cs = do
   let noexclauses = forMaybe noex $ \ i -> do
         let cl = indexWithDefault __IMPOSSIBLE__ cs1 i
         if clauseCatchall cl then Nothing else Just cl
-  unless (null noexclauses) $ do
-      setCurrentRange (map clauseLHSRange noexclauses) $
-        warning $ CoverageNoExactSplit f $ noexclauses
+  List1.unlessNull noexclauses \ noexclauses -> do
+      setCurrentRange (fmap clauseLHSRange noexclauses) $
+        warning $ CoverageNoExactSplit f noexclauses
   return splitTree
 
 -- | Top-level function for eliminating redundant clauses in the interactive
@@ -300,8 +287,15 @@ cover f cs sc@(SClause tel ps _ _ target) = updateRelevance $ do
     Yes (i,mps) -> do
       reportSLn "tc.cover.cover" 10 $ "pattern covered by clause " ++ show i
       reportSDoc "tc.cover.cover" 20 $ text "with mps = " <+> do addContext tel $ pretty mps
-      exact <- allM mps $ isTrivialPattern . snd
       let cl0 = indexWithDefault __IMPOSSIBLE__ cs i
+      -- Szumi, 2024-09-15, issue #7495: If the split clause has more
+      -- patterns than the function clause, then the extra patterns need to
+      -- be trivial for the clause to be exact
+      let extra = drop (length $ namedClausePats cl0) ps
+      exact <-
+        and2M
+          (allM mps $ isTrivialPattern . snd)
+          (allM extra $ isTrivialPattern . namedArg)
       cl <- applyCl sc cl0 mps
       return $ CoverResult
         { coverSplitTree      = SplittingDone (size tel)
@@ -462,7 +456,6 @@ cover f cs sc@(SClause tel ps _ _ target) = updateRelevance $ do
                     , clauseBody      = (`applyE` patternsToElims extra) . (s `applyPatSubst`) <$> clauseBody cl
                     , clauseType      = ty
                     , clauseCatchall    = clauseCatchall cl
-                    , clauseExact       = clauseExact cl
                     , clauseRecursive   = clauseRecursive cl
                     , clauseUnreachable = clauseUnreachable cl
                     , clauseEllipsis    = clauseEllipsis cl
@@ -677,7 +670,6 @@ inferMissingClause f (SClause tel ps _ cps (Just t)) = setCurrentRange f $ do
                   , clauseBody      = Just rhs
                   , clauseType      = Just (argFromDom t)
                   , clauseCatchall    = False
-                  , clauseExact       = Just True
                   , clauseRecursive   = Nothing     -- could be recursive
                   , clauseUnreachable = Just False  -- missing, thus, not unreachable
                   , clauseEllipsis    = NoEllipsis
@@ -711,7 +703,7 @@ splitStrategy bs tel = return $ updateLast setBlockingVarOverlap xs
 -- the data type must be inductive.
 isDatatype :: (MonadTCM tcm, MonadError SplitError tcm) =>
               Induction -> Dom Type ->
-              tcm (DataOrRecord, QName, Args, Args, [QName], Bool)
+              tcm (DataOrRecord, QName, Sort, Args, Args, [QName], Bool)
 isDatatype ind at = do
   let t       = unDom at
       throw f = throwError . f =<< do liftTCM $ buildClosure t
@@ -723,21 +715,22 @@ isDatatype ind at = do
     Def d [Apply phi] | Just d == mIsOne -> do
                 xs <- liftTCM $ decomposeInterval =<< reduce (unArg phi)
                 if null xs
-                   then return $ (IsData, d, [phi], [], [], False)
+                   then return $ (IsData, d, mkSSet 0, [phi], [], [], False)
                    else throw NotADatatype
     Def d es -> do
       let ~(Just args) = allApplyElims es
-      def <- liftTCM $ theDef <$> getConstInfo d
-      case def of
-        Datatype{dataPars = np, dataCons = cs}
+      def <- liftTCM $ getConstInfo d
+      case theDef def of
+        Datatype{dataSort = s, dataPars = np, dataCons = cs}
           | otherwise -> do
               let (ps, is) = splitAt np args
-              return (IsData, d, ps, is, cs, not $ null (dataPathCons def))
+              return (IsData, d, s, ps, is, cs, not $ null (dataPathCons $ theDef def))
         Record{recPars = np, recConHead = con, recInduction = i, recEtaEquality'}
           | i == Just CoInductive && ind /= CoInductive ->
               throw CoinductiveDatatype
-          | otherwise ->
-              return (IsRecord InductionAndEta { recordInduction=i, recordEtaEquality=recEtaEquality' }, d, args, [], [conName con], False)
+          | otherwise -> do
+              s <- liftTCM $ shouldBeSort =<< defType def `piApplyM` args
+              return (IsRecord InductionAndEta { recordInduction=i, recordEtaEquality=recEtaEquality' }, d, s, args, [], [conName con], False)
         _ -> throw NotADatatype
     _ -> throw NotADatatype
 
@@ -1256,7 +1249,7 @@ split' checkEmpty ind allowPartialCover inserttrailing
         -- Check that t is a datatype or a record
         -- Andreas, 2010-09-21, isDatatype now directly throws an exception if it fails
         -- cons = constructors of this datatype
-        (dr, d, pars, ixs, cons', isHIT) <- inContextOfT $ isDatatype ind t
+        (dr, d, s, pars, ixs, cons', isHIT) <- inContextOfT $ isDatatype ind t
         isFib <- lift $ isFibrant t
         cons <- case checkEmpty of
           CheckEmpty   -> ifM (liftTCM $ inContextOfT $ isEmptyType $ unDom t) (pure []) (pure cons')
@@ -1268,6 +1261,7 @@ split' checkEmpty ind allowPartialCover inserttrailing
                    else return Nothing
         let ns = catMaybes mns
         return ( dr
+               , s
                , not (null ixs) -- Is "d" indexed?
                , length $ ns
                , ns ++ catMaybes ([fmap (fmap (,NoInfo)) hcompsc | not $ null $ ns])
@@ -1301,11 +1295,11 @@ split' checkEmpty ind allowPartialCover inserttrailing
         -- following code should be changed (the constructor False
         -- stands for "not indexed").
         let ns' = map ((fmap (,NoInfo))) $ ns ++ [ ca ]
-        return (IsData, False, length ns', ns')
+        return (IsData, mkType 0, False, length ns', ns')
 
   -- numMatching is the number of proper constructors matching, excluding hcomp.
   -- for literals this considers the catchall clause as 1 extra constructor.
-  (dr, isIndexed, numMatching, ns) <- if null pcons' && not (null plits)
+  (dr, s, isIndexed, numMatching, ns) <- if null pcons' && not (null plits)
         then computeLitNeighborhoods
         else computeNeighborhoods
 
@@ -1382,7 +1376,8 @@ split' checkEmpty ind allowPartialCover inserttrailing
                 ]
               throwError (GenericSplitError "precomputed set of constructors does not cover all cases")
 
-      liftTCM $ inContextOfT $ checkSortOfSplitVar dr (unDom t) delta2 target
+      let t' = set lensSort s $ unDom t
+      liftTCM $ inContextOfT $ checkSortOfSplitVar dr t' delta2 target
       return $ Right $ Covering (lookupPatternVar sc x) ns
 
   where
@@ -1458,9 +1453,10 @@ splitResultRecord f sc@(SClause tel ps _ _ target) = do
   -- if we want to split projections, but have no target type, we give up
   let failure = return . Left
   caseMaybe target (failure CosplitNoTarget) $ \ t -> do
-    isR <- addContext tel $ isRecordType $ unDom t
-    case isR of
-      Just (_r, vs, Record{ recFields = fs }) -> do
+    (addContext tel $ isRecordType $ unDom t) >>= \case
+      Nothing -> addContext tel $ do
+        failure . CosplitNoRecordType =<< buildClosure (unDom t)
+      Just (_r, vs, RecordData{ _recFields = fs }) -> do
         reportSDoc "tc.cover" 20 $ sep
           [ text $ "we are of record type _r = " ++ prettyShow _r
           , text   "applied to parameters vs =" <+> addContext tel (prettyTCM vs)
@@ -1506,8 +1502,6 @@ splitResultRecord f sc@(SClause tel ps _ _ target) = do
               [ "fieldSub for" <+> prettyTCM (unDom proj)
               , nest 2 $ pretty fieldSub ]
             return (SplitCon (unDom proj), (sc', NoInfo))
-      _ -> addContext tel $ do
-        buildClosure (unDom t) >>= failure . CosplitNoRecordType
   -- Andreas, 2018-06-09, issue #2170: splitting with irrelevant fields is always fine!
   -- where
   -- -- A record type is strong if it has all the projections.

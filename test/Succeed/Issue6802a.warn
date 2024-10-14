@@ -1,13 +1,4 @@
-Issue6802a.agda:7,3-9,15
-warning: -W[no]NotAffectedByOpaque
-Only function definitions can be marked opaque. This definition
-will be treated as transparent.
-when scope checking the declaration
-  record Foo where
-    foo : Nat
-    foo = zero
-Issue6802a.agda:6,1-7
-warning: -W[no]UselessOpaque
+Issue6802a.agda:6.1-7: warning: -W[no]UselessOpaque
 This 'opaque' block has no effect.
 when scope checking the declaration
   opaque
@@ -17,20 +8,18 @@ when scope checking the declaration
       record Foo where
         foo : Nat
         foo = zero
+
+Issue6802a.agda:7.3-9.15: warning: -W[no]NotAffectedByOpaque
+Only function definitions can be marked opaque. This definition
+will be treated as transparent.
+when scope checking the declaration
+  record Foo where
+    foo : Nat
+    foo = zero
 
 ———— All done; warnings encountered ————————————————————————
 
-Issue6802a.agda:7,3-9,15
-warning: -W[no]NotAffectedByOpaque
-Only function definitions can be marked opaque. This definition
-will be treated as transparent.
-when scope checking the declaration
-  record Foo where
-    foo : Nat
-    foo = zero
-
-Issue6802a.agda:6,1-7
-warning: -W[no]UselessOpaque
+Issue6802a.agda:6.1-7: warning: -W[no]UselessOpaque
 This 'opaque' block has no effect.
 when scope checking the declaration
   opaque
@@ -40,3 +29,11 @@ when scope checking the declaration
       record Foo where
         foo : Nat
         foo = zero
+
+Issue6802a.agda:7.3-9.15: warning: -W[no]NotAffectedByOpaque
+Only function definitions can be marked opaque. This definition
+will be treated as transparent.
+when scope checking the declaration
+  record Foo where
+    foo : Nat
+    foo = zero

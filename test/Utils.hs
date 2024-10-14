@@ -138,9 +138,7 @@ runAgdaWithOptions testName opts mflag mvars = do
         -- a missing '=' might mean to set the variable to the empty string.
 
 hasWarning :: Text -> Bool
-hasWarning t =
- "———— All done; warnings encountered ————————————————————————"
- `T.isInfixOf` t
+hasWarning = T.isInfixOf "warning: -W[no]"
 
 getAgdaBin :: EnvVars -> FilePath
 getAgdaBin = getProg "agda"
@@ -323,6 +321,7 @@ cleanOutput' agda pwd t = foldl (\ t' (rgx, n) -> replace rgx n t') t rgxs
         -- First, replace backslashes by slashes, then try to match @pwd@,
         -- which has already backslashes by slashes replaced.
       , (T.pack pwd `T.append` ".test", "..")
+      , ("/[^ ]*/MAlonzo/Code/", "«path»/MAlonzo/Code/")
       , ("\\.hs(:[[:digit:]]+){2}", ".hs:«line»:«col»")
       , (T.pack Agda.Version.package, "«Agda-package»")
       -- Andreas, 2021-08-26.  When run with 'cabal test',
@@ -402,3 +401,14 @@ goldenVsAction' name ref act toTxt =
     textDiff
     ShowText
     (BS.writeFile ref . encodeUtf8)
+
+-- | Scrapes the output of @agda --version@
+-- to determine whether agda was built with or without
+-- the @-fdebug@ cabal flag.
+wasAgdaCompiledWithFDebug :: IO Bool
+wasAgdaCompiledWithFDebug = do
+  (_code , out, _err) <-
+    readAgdaProcessWithExitCode
+      Nothing ["--version"] ""
+  let flines = dropWhile (/= "Built with flags (cabal -f)") $ T.lines out
+  return $ " - debug: enable debug printing ('-v' verbosity flags)" `elem` flines

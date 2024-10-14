@@ -22,6 +22,8 @@ fromList = primStringFromList
 stringToList : String -> List Char
 stringToList = primStringToList
 
+-- Unlike primShowChar, this function
+-- does not add quotes
 charToStr : Char → String
 charToStr c = primStringFromList (c ∷ [])
 
@@ -29,4 +31,4 @@ intToString : Integer → String
 intToString = primShowInteger
 
 natToString : Nat -> String
-natToString n = intToString (pos n)
+natToString = primShowNat

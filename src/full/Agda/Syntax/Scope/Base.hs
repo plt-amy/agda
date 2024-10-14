@@ -45,6 +45,7 @@ import Agda.Utils.Maybe (filterMaybe)
 import Agda.Utils.Null
 import Agda.Syntax.Common.Pretty hiding ((<>))
 import qualified Agda.Syntax.Common.Pretty as P
+import Agda.Utils.Set1 ( Set1 )
 import Agda.Utils.Singleton
 import qualified Agda.Utils.Map as Map
 
@@ -119,6 +120,8 @@ data ScopeInfo = ScopeInfo
       , _scopeInScope       :: InScopeSet
       , _scopeFixities      :: C.Fixities    -- ^ Maps concrete names C.Name to fixities
       , _scopePolarities    :: C.Polarities  -- ^ Maps concrete names C.Name to polarities
+      , _scopeRecords       :: Map A.QName (A.QName, Maybe Induction)
+        -- ^ Maps the name of a record to the name of its (co)constructor.
       }
   deriving (Show, Generic)
 
@@ -140,7 +143,7 @@ type ModuleMap = Map A.ModuleName [C.QName]
 -- type ModuleMap = Map A.ModuleName (List1 C.QName)
 
 instance Eq ScopeInfo where
-  ScopeInfo c1 m1 v1 l1 p1 _ _ _ _ _ == ScopeInfo c2 m2 v2 l2 p2 _ _ _ _ _ =
+  ScopeInfo c1 m1 v1 l1 p1 _ _ _ _ _ _ == ScopeInfo c2 m2 v2 l2 p2 _ _ _ _ _ _ =
     c1 == c2 && m1 == m2 && v1 == v2 && l1 == l2 && p1 == p2
 
 -- | Local variables.
@@ -160,6 +163,8 @@ data BindingSource
       -- ^ @let ... in@
   | WithBound
       -- ^ @| ... in q@
+  | MacroBound
+      -- ^ Binding added to scope by one of context-manipulating reflection primitives
   deriving (Show, Eq, Generic)
 
 instance Pretty BindingSource where
@@ -168,7 +173,7 @@ instance Pretty BindingSource where
     PatternBound _ -> "pattern"
     LetBound     -> "let-bound"
     WithBound    -> "with-bound"
-
+    MacroBound   -> "macro-bound"
 -- | A local variable can be shadowed by an import.
 --   In case of reference to a shadowed variable, we want to report
 --   a scope error.
@@ -264,6 +269,11 @@ scopePolarities :: Lens' ScopeInfo C.Polarities
 scopePolarities f s =
   f (_scopePolarities s) <&>
   \x -> s { _scopePolarities = x }
+
+scopeRecords :: Lens' ScopeInfo (Map A.QName (A.QName, Maybe Induction))
+scopeRecords f s =
+  f (_scopeRecords s) <&>
+  \x -> s { _scopeRecords = x }
 
 scopeFixitiesAndPolarities :: Lens' ScopeInfo (C.Fixities, C.Polarities)
 scopeFixitiesAndPolarities f s =
@@ -382,8 +392,16 @@ data KindOfName
   -- End @DefName@.  Keep these together in sequence, for sake of @isDefName@!
   deriving (Eq, Ord, Show, Enum, Bounded, Generic)
 
+-- | All kinds of regular definitions.
+defNameKinds :: [KindOfName]
+defNameKinds = [DataName .. OtherDefName]
+
 isDefName :: KindOfName -> Bool
 isDefName = (>= DataName)
+
+-- | Constructor and pattern synonyms.
+conLikeNameKinds :: [KindOfName]
+conLikeNameKinds = [ConName, CoConName, PatternSynName]
 
 isConName :: KindOfName -> Maybe Induction
 isConName = \case
@@ -522,7 +540,9 @@ data ResolvedName
     FieldName (List1 AbstractName)       -- ^ @('FldName' ==) . 'anameKind'@ for all names.
 
   | -- | Data or record constructor name.
-    ConstructorName (Set Induction) (List1 AbstractName) -- ^ @isJust . 'isConName' . 'anameKind'@ for all names.
+    ConstructorName
+      (Set1 Induction)      -- ^ 'Inductive' or 'CoInductive' or both.
+      (List1 AbstractName)  -- ^ @isJust . 'isConName' . 'anameKind'@ for all names.
 
   | -- | Name of pattern synonym.
     PatternSynResName (List1 AbstractName) -- ^ @('PatternSynName' ==) . 'anameKind'@ for all names.
@@ -552,6 +572,16 @@ data AmbiguousNameReason
       -- ^ The name resolves both to a local variable and some declared names.
   | AmbiguousDeclName (List2 AbstractName)
       -- ^ The name resolves to at least 2 declared names.
+  deriving (Show, Generic)
+
+-- | A failure in name resolution, indicating the reason that a name
+-- which /is/ in scope could not be returned from @tryResolveName@.
+data NameResolutionError
+  = IllegalAmbiguity  AmbiguousNameReason
+  -- ^ Ambiguous names are not supported in this situation.
+  | ConstrOfNonRecord C.QName ResolvedName
+  -- ^ The name was @Foo.constructor@, and @Foo@ is in scope, but it is
+  -- not a record.
   deriving (Show, Generic)
 
 -- | The flat list of ambiguous names in 'AmbiguousNameReason'.
@@ -694,6 +724,7 @@ emptyScopeInfo = ScopeInfo
   , _scopeInScope       = Set.empty
   , _scopeFixities      = Map.empty
   , _scopePolarities    = Map.empty
+  , _scopeRecords       = Map.empty
   }
 
 -- | Map functions over the names and modules in a scope.
@@ -1079,6 +1110,9 @@ publicNames scope =
   Set.fromList $ List1.concat $ Map.elems $
   exportedNamesInScope $ mergeScopes $ Map.elems $ publicModules scope
 
+publicNamesOfModules :: Map A.ModuleName Scope -> [AbstractName]
+publicNamesOfModules = List1.concat . Map.elems . exportedNamesInScope . mergeScopes . Map.elems
+
 everythingInScope :: ScopeInfo -> NameSpace
 everythingInScope scope = allThingsInScope $ mergeScopes $
     (s0 :) $ map look $ scopeParents s0
@@ -1442,7 +1476,7 @@ blockOfLines _  [] = []
 blockOfLines hd ss = hd : map (nest 2) ss
 
 instance Pretty ScopeInfo where
-  pretty (ScopeInfo this mods toBind locals ctx _ _ _ _ _) = vcat $ concat
+  pretty (ScopeInfo this mods toBind locals ctx _ _ _ _ _ _) = vcat $ concat
     [ [ "ScopeInfo"
       , nest 2 $ "current =" <+> pretty this
       ]

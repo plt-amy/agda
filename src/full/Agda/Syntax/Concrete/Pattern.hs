@@ -17,7 +17,7 @@ import Agda.Utils.AffineHole
 import Agda.Utils.Functor
 import Agda.Utils.Impossible
 import Agda.Utils.List
-import Agda.Utils.List1  ( List1, pattern (:|) )
+import Agda.Utils.List1  ( List1, pattern (:|), (<|) )
 import Agda.Utils.List2  ( List2 )
 import Agda.Utils.Maybe
 import Agda.Utils.Singleton
@@ -77,9 +77,9 @@ instance IsWithP p => IsWithP (Named n p) where
 --
 -- (This view discards 'PatInfo'.)
 data LHSPatternView
-  = LHSAppP  [NamedArg Pattern]
+  = LHSAppP  (List1 (NamedArg Pattern))
       -- ^ Application patterns (non-empty list).
-  | LHSWithP [Pattern]
+  | LHSWithP (List1 Pattern)
       -- ^ With patterns (non-empty list).
       --   These patterns are not prefixed with 'WithP'.
 
@@ -91,22 +91,22 @@ lhsPatternView :: [NamedArg Pattern] -> Maybe (LHSPatternView, [NamedArg Pattern
 lhsPatternView [] = Nothing
 lhsPatternView (p0 : ps) =
   case namedArg p0 of
-    WithP _i p   -> Just (LHSWithP (p : map namedArg ps1), ps2)
+    WithP _i p   -> Just (LHSWithP (p :| map namedArg ps1), ps2)
       where
       (ps1, ps2) = spanJust isWithP ps
     -- If the next pattern is an application pattern, collect more of these
-    _ -> Just (LHSAppP (p0 : ps1), ps2)
+    _ -> Just (LHSAppP (p0 :| ps1), ps2)
       where
       (ps1, ps2) = span (isNothing . isWithP) ps
 
 -- | Add applicative patterns (non-projection / non-with patterns) to the right.
-lhsCoreApp :: LHSCore -> [NamedArg Pattern] -> LHSCore
+lhsCoreApp :: LHSCore -> List1 (NamedArg Pattern) -> LHSCore
 lhsCoreApp (LHSEllipsis r core) ps = LHSEllipsis r $ lhsCoreApp core ps
-lhsCoreApp core ps = core { lhsPats = lhsPats core ++ ps }
+lhsCoreApp core ps = core { lhsPats = lhsPats core ++ List1.toList ps }
 
 -- | Add with-patterns to the right.
-lhsCoreWith :: LHSCore -> [Pattern] -> LHSCore
-lhsCoreWith (LHSWith core wps []) wps' = LHSWith core (wps ++ wps') []
+lhsCoreWith :: LHSCore -> List1 Pattern -> LHSCore
+lhsCoreWith (LHSWith core wps []) wps' = LHSWith core (wps <> wps') []
 lhsCoreWith core                  wps' = LHSWith core wps' []
 
 -- | Append patterns to 'LHSCore', separating with patterns from the rest.
@@ -169,8 +169,8 @@ class CPatternLike p where
   traverseCPatternA = traverse . traverseCPatternA
 
   -- | Traverse pattern.
-  traverseCPatternM
-    :: Monad m => (Pattern -> m Pattern)  -- ^ @pre@: Modification before recursion.
+  traverseCPatternM :: Monad m
+    => (Pattern -> m Pattern)  -- ^ @pre@: Modification before recursion.
     -> (Pattern -> m Pattern)  -- ^ @post@: Modification after recursion.
     -> p -> m p
 
@@ -198,7 +198,7 @@ instance CPatternLike Pattern where
       -- Nonrecursive cases:
       IdentP _ _      -> mempty
       WildP _         -> mempty
-      DotP _ _        -> mempty
+      DotP _ _ _      -> mempty
       AbsurdP _       -> mempty
       LitP _ _        -> mempty
       QuoteP _        -> mempty
@@ -219,7 +219,7 @@ instance CPatternLike Pattern where
       -- Nonrecursive cases:
       IdentP _ _      -> pure p0
       WildP _         -> pure p0
-      DotP _ _        -> pure p0
+      DotP _ _ _      -> pure p0
       AbsurdP _       -> pure p0
       LitP _ _        -> pure p0
       QuoteP _        -> pure p0
@@ -242,7 +242,7 @@ instance CPatternLike Pattern where
       -- Nonrecursive cases:
       IdentP _ _      -> return p0
       WildP _         -> return p0
-      DotP _ _        -> return p0
+      DotP _ _ _      -> return p0
       AbsurdP _       -> return p0
       LitP _ _        -> return p0
       QuoteP _        -> return p0
@@ -317,7 +317,7 @@ patternQNames p = foldCPattern f p `appEndo` []
     ParenP _ _     -> mempty
     WildP _        -> mempty
     AbsurdP _      -> mempty
-    DotP _ _       -> mempty
+    DotP _ _ _     -> mempty
     LitP _ _       -> mempty
     QuoteP _       -> mempty
     InstanceP _ _  -> mempty
@@ -381,7 +381,7 @@ splitEllipsis k (p:ps)
 patternAppView :: Pattern -> List1 (NamedArg Pattern)
 patternAppView = \case
     AppP p arg      -> patternAppView p `List1.appendList` [arg]
-    OpAppP _ x _ ps -> defaultNamedArg (IdentP True x) :| ps
+    OpAppP _ x _ ps -> defaultNamedArg (IdentP True x) <| ps
     ParenP _ p      -> patternAppView p
     RawAppP _ _     -> __IMPOSSIBLE__
     p               -> singleton $ defaultNamedArg p

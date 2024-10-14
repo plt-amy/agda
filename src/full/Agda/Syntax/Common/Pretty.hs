@@ -10,6 +10,7 @@ module Agda.Syntax.Common.Pretty
 
 import Prelude hiding (null)
 
+import qualified Data.List as List
 import qualified Data.Foldable as Fold
 import qualified Data.IntSet as IntSet
 import qualified Data.IntMap as IntMap
@@ -131,9 +132,9 @@ instance Pretty RangeFile where
   pretty = pretty . rangeFilePath
 
 instance Pretty a => Pretty (Position' (Strict.Maybe a)) where
-  pretty (Pn Strict.Nothing  _ l c) = pretty l <> "," <> pretty c
+  pretty (Pn Strict.Nothing  _ l c) = pretty l <> dot <> pretty c
   pretty (Pn (Strict.Just f) _ l c) =
-    pretty f <> ":" <> pretty l <> "," <> pretty c
+    pretty f <> colon <> pretty l <> dot <> pretty c
 
 instance Pretty PositionWithoutFile where
   pretty p = pretty (p { srcFile = Strict.Nothing } :: Position)
@@ -147,11 +148,11 @@ instance Pretty IntervalWithoutFile where
       ec = posCol e
 
       start :: Doc
-      start = pretty sl <> comma <> pretty sc
+      start = pretty sl <> dot <> pretty sc
 
       end :: Doc
         | sl == el  = pretty ec
-        | otherwise = pretty el <> comma <> pretty ec
+        | otherwise = pretty el <> dot <> pretty ec
 
 instance Pretty a => Pretty (Interval' (Strict.Maybe a)) where
   pretty i@(Interval s _) = file <> pretty (setIntervalFile () i)
@@ -181,6 +182,9 @@ punctuate :: Foldable t => Doc -> t Doc -> [Doc]
 punctuate d = P.punctuate d . Fold.toList
 
 -- * 'Doc' utilities
+
+vsep :: [Doc] -> Doc
+vsep = vcat . List.intersperse ""
 
 pwords :: String -> [Doc]
 pwords = map text . words
@@ -225,6 +229,12 @@ mparens False = id
 parensNonEmpty :: Doc -> Doc
 parensNonEmpty d = if null d then empty else parens d
 
+-- | Return 'empty' for empty strings.
+textNonEmpty :: String -> Doc
+textNonEmpty = \case
+  "" -> empty
+  s  -> text s
+
 -- | @align max rows@ lays out the elements of @rows@ in two columns,
 -- with the second components aligned. The alignment column of the
 -- second components is at most @max@ characters to the right of the
@@ -252,6 +262,9 @@ pshow = text . show
 
 singPlural :: Sized a => a -> c -> c -> c
 singPlural xs singular plural = if natSize xs == 1 then singular else plural
+
+pluralS :: Sized a => a -> Doc -> Doc
+pluralS xs d = singPlural xs d (d <> "s")
 
 -- | Used for with-like 'telescopes'
 
@@ -310,10 +323,11 @@ parens p       = lparen <> hlSubtree p <> rparen
 brackets p     = lbrack <> hlSubtree p <> rbrack
 braces p       = lbrace <> hlSubtree p <> rbrace
 
-semi, comma, colon, space, equals, lparen, rparen, lbrack, rbrack, lbrace, rbrace :: Doc
+semi, comma, colon, dot, space, equals, lparen, rparen, lbrack, rbrack, lbrace, rbrace :: Doc
 semi   = hlSymbol $ char ';'
 comma  = hlSymbol $ char ','
 colon  = hlSymbol $ char ':'
+dot    = hlSymbol $ char '.'
 space  = hlSymbol $ char ' '
 equals = hlSymbol $ char '='
 lparen = hlSymbol $ char '('

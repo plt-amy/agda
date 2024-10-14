@@ -126,10 +126,9 @@ module Agda.TypeChecking.Rules.LHS.Unify
 
 import Prelude hiding (null)
 
-import Control.Monad
-import Control.Monad.State
-import Control.Monad.Writer (WriterT(..), MonadWriter(..))
-import Control.Monad.Except
+import Control.Monad.State  ( gets, modify, evalStateT )
+import Control.Monad.Writer ( WriterT(..), MonadWriter(..) )
+import Control.Monad.Except ( runExceptT, MonadError )
 
 import Data.Semigroup hiding (Arg)
 import qualified Data.List as List
@@ -683,8 +682,8 @@ unifyStep s Cycle
 
 unifyStep s EtaExpandVar{ expandVar = fi, expandVarRecordType = d , expandVarParameters = pars } = do
   recd <- fromMaybe __IMPOSSIBLE__ <$> isRecord d
-  let delta = recTel recd `apply` pars
-      c     = recConHead recd
+  let delta = _recTel recd `apply` pars
+      c     = _recConHead recd
   let nfields         = size delta
       (varTel', rho)  = expandTelescopeVar (varTel s) (m-1-i) delta c
       projectFlexible = [ FlexibleVar (getArgInfo fi) (flexForced fi) (projFlexKind j) (flexPos fi) (i + j) | j <- [0 .. nfields - 1] ]
@@ -715,8 +714,8 @@ unifyStep s EtaExpandVar{ expandVar = fi, expandVarRecordType = d , expandVarPar
 
 unifyStep s EtaExpandEquation{ expandAt = k, expandRecordType = d, expandParameters = pars } = do
   recd  <- fromMaybe __IMPOSSIBLE__ <$> isRecord d
-  let delta = recTel recd `apply` pars
-      c     = recConHead recd
+  let delta = _recTel recd `apply` pars
+      c     = _recConHead recd
   lhs   <- expandKth $ eqLHS s
   rhs   <- expandKth $ eqRHS s
   let (tel, sigma) = expandTelescopeVar (eqTel s) k delta c
@@ -849,7 +848,7 @@ solutionStep retry s
   let eqrel  = getRelevance dom
       eqmod  = getModality dom
       varmod = getModality dom'
-      mod    = applyUnless (NonStrict `moreRelevant` eqrel) (setRelevance eqrel)
+      mod    = applyUnless (shapeIrrelevant `moreRelevant` eqrel) (setRelevance eqrel)
              $ applyUnless (usableQuantity envmod) (setQuantity zeroQuantity)
              $ varmod
   reportSDoc "tc.lhs.unify" 65 $ text $ "Equation modality: " ++ show (getModality dom)

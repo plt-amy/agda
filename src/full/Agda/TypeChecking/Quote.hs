@@ -25,25 +25,26 @@ import Agda.TypeChecking.Substitute
 import Agda.Utils.Impossible
 import Agda.Utils.Functor
 import Agda.Utils.List
-import Agda.Syntax.Common.Pretty (prettyShow)
+import Agda.Utils.List1 ( pattern (:|) )
+import Agda.Utils.List2 ( pattern List2 )
 import Agda.Utils.Size
+import qualified Agda.Utils.Maybe.Strict as Strict
 
 -- | Parse @quote@.
 quotedName :: (MonadTCError m, MonadAbsToCon m) => A.Expr -> m QName
 quotedName = \case
-  A.Var x          -> genericError $ "Cannot quote a variable " ++ prettyShow x
-  A.Def x          -> return x
-  A.Macro x        -> return x
-  A.Proj _o p      -> unambiguous p
-  A.Con c          -> unambiguous c
-  A.ScopedExpr _ e -> quotedName e
-  e -> genericDocError =<< do
-    text "Can only quote defined names, but encountered" <+> prettyA e
+  -- Andreas, 2024-09-27, issue #7514
+  -- Is it intended to be able to quote Set but not Set1?
+  A.Def' x NoSuffix -> return x
+  A.Macro x         -> return x
+  A.Proj _o p       -> unambiguous p
+  A.Con c           -> unambiguous c
+  A.ScopedExpr _ e  -> quotedName e
+  e -> typeError $ CannotQuote $ CannotQuoteExpression e
   where
-  unambiguous xs
-    | Just x <- getUnambiguous xs = return x
-    | otherwise =
-        genericError $ "quote: Ambiguous name: " ++ prettyShow (unAmbQ xs)
+    unambiguous (AmbQ (x :| xs)) = case xs of
+      []   -> return x
+      y:ys -> typeError $ CannotQuote $ CannotQuoteAmbiguous $ List2 x y ys
 
 
 data QuotingKit = QuotingKit
@@ -129,9 +130,10 @@ quotingKit = do
       quoteHiding NotHidden  = pure visible
 
       quoteRelevance :: Relevance -> ReduceM Term
-      quoteRelevance Relevant   = pure relevant
-      quoteRelevance Irrelevant = pure irrelevant
-      quoteRelevance NonStrict  = pure relevant
+      quoteRelevance = \case
+        Relevant        {} -> pure relevant
+        Irrelevant      {} -> pure irrelevant
+        ShapeIrrelevant {} -> pure relevant
 
       quoteQuantity :: Quantity -> ReduceM Term
       quoteQuantity (Quantity0 _) = pure quantity0
@@ -262,12 +264,16 @@ quotingKit = do
           Lam info t -> lam !@ quoteHiding (getHiding info) @@ quoteAbs quoteTerm t
           Def x es   -> do
             defn <- getConstInfo x
+            patlams <- viewTC ePrintingPatternLambdas
+            let isSeenPatLam = elem x patlams
             r <- isReconstructed
             -- #2220: remember to restore dropped parameters
             let
               conOrProjPars = defParameters defn r
               ts = fromMaybe __IMPOSSIBLE__ $ allApplyElims es
-              qx Function{ funExtLam = Just (ExtLamInfo m False _), funClauses = cs } = do
+              qx Function{ funExtLam = Just (ExtLamInfo m False Strict.Nothing), funClauses = cs }
+                | not isSeenPatLam = locallyTC ePrintingPatternLambdas (x :) $ do
+
                     -- An extended lambda should not have any extra parameters!
                     unless (null conOrProjPars) __IMPOSSIBLE__
                     cs <- return $ filter (not . generatedClause) cs
@@ -275,7 +281,8 @@ quotingKit = do
                     let (pars, args) = splitAt n ts
                     extlam !@ list (map (quoteClause (Left ()) . (`apply` pars)) cs)
                            @@ list (map (quoteArg quoteTerm) args)
-              qx df@Function{ funExtLam = Just (ExtLamInfo _ True _), funCompiled = Just Fail{}, funClauses = [cl] } = do
+              qx df@Function{ funExtLam = Just (ExtLamInfo _ True Strict.Nothing), funCompiled = Just Fail{}, funClauses = [cl] }
+                | not isSeenPatLam = locallyTC ePrintingPatternLambdas (x :) $ do
                     -- See also corresponding code in InternalToAbstract
                     let n = length (namedClausePats cl) - 1
                         pars = take n ts
@@ -339,8 +346,9 @@ quotingKit = do
             agdaDefinitionFunDef !@ quoteList (quoteClause (Left ())) cs
           Primitive{}   -> pure agdaDefinitionPrimitive
           PrimitiveSort{} -> pure agdaDefinitionPrimitive
-          Constructor{conData = d} ->
-            agdaDefinitionDataConstructor !@! quoteName d
+          Constructor{conData = d, conSrcCon = c} -> do
+            q <- getQuantity <$> getConstInfo (conName c)
+            agdaDefinitionDataConstructor !@! quoteName d @@ quoteQuantity q
 
   return $ QuotingKit quoteTerm quoteType (quoteDom quoteType) quoteDefn quoteList
 

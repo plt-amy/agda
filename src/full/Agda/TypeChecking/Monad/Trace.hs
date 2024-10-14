@@ -4,14 +4,16 @@ module Agda.TypeChecking.Monad.Trace where
 
 import Prelude hiding (null)
 
-import Control.Monad.Except
-import Control.Monad.Reader
-import Control.Monad.State
-import Control.Monad.Trans.Identity
-import Control.Monad.Writer
+import Control.Monad.Except         ( ExceptT  (ExceptT  ), runExceptT   , throwError )
+import Control.Monad.Reader         ( ReaderT  (ReaderT  ), runReaderT   )
+import Control.Monad.State          ( StateT   (StateT   ), runStateT    )
+import Control.Monad.Trans.Identity ( IdentityT(IdentityT), runIdentityT )
+import Control.Monad.Trans.Maybe    ( MaybeT   (MaybeT   ), runMaybeT    )
+import Control.Monad.Writer         ( WriterT  (WriterT  ), runWriterT   )
 
 import qualified Data.Set as Set
 
+import Agda.Syntax.Parser (PM, runPMIO)
 import Agda.Syntax.Position
 import qualified Agda.Syntax.Position as P
 
@@ -23,6 +25,7 @@ import Agda.TypeChecking.Monad.Base
   hiding (ModuleInfo, MetaInfo, Primitive, Constructor, Record, Function, Datatype)
 import Agda.TypeChecking.Monad.Debug
 import Agda.TypeChecking.Monad.State
+import Agda.TypeChecking.Warnings (warning)
 
 import Agda.Utils.Function
 import qualified Agda.Utils.Maybe.Strict as Strict
@@ -117,6 +120,9 @@ class (MonadTCEnv m, ReadTCState m) => MonadTrace m where
 
 instance MonadTrace m => MonadTrace (IdentityT m) where
   traceClosureCall c f = IdentityT $ traceClosureCall c $ runIdentityT f
+
+instance MonadTrace m => MonadTrace (MaybeT m) where
+  traceClosureCall c f = MaybeT $ traceClosureCall c $ runMaybeT f
 
 instance MonadTrace m => MonadTrace (ReaderT r m) where
   traceClosureCall c f = ReaderT $ \r -> traceClosureCall c $ runReaderT f r
@@ -271,3 +277,26 @@ highlightAsTypeChecked rPre r m
     return v
     where
     p rs x = printHighlightingInfo KeepHighlighting (singleton rs x)
+
+---------------------------------------------------------------------------
+-- * Warnings in the parser
+---------------------------------------------------------------------------
+
+-- | Running the Parse monad, raising parser warnings.
+
+runPM :: PM a -> TCM a
+runPM m = do
+  (res, ws) <- runPMIO m
+  forM_ ws \ w -> setCurrentRange w $ warning $ ParseWarning w
+  case res of
+    Left  e -> throwError $ ParserError e
+    Right a -> return a
+
+-- | Running the Parse monad, dropping parser warnings.
+
+runPMDropWarnings :: PM a -> TCM a
+runPMDropWarnings m = do
+  (res, _ws) <- runPMIO m
+  case res of
+    Left  e -> throwError $ ParserError e
+    Right a -> return a

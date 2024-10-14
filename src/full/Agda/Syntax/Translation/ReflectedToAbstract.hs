@@ -238,11 +238,6 @@ mkVar i = ifJustM (askVar i) return $ do
 mkVarName :: MonadReflectedToAbstract m => Int -> m Name
 mkVarName i = fst <$> mkVar i
 
-annotatePattern :: MonadReflectedToAbstract m => Int -> R.Type -> A.Pattern -> m A.Pattern
-annotatePattern _ R.Unknown p = return p
-annotatePattern i t p = local (drop $ i + 1) $ do
-  t <- toAbstract t  -- go into the right context for translating the type
-  return $ A.AnnP patNoRange t p
 
 instance ToAbstract Sort where
   type AbsOfRef Sort = A.Expr
@@ -266,12 +261,10 @@ instance ToAbstract R.Pattern where
       return $ A.ConP (ConPatInfo ConOCon patNoRange ConPatEager) (unambiguous $ killRange c) args
     R.DotP t -> A.DotP patNoRange <$> toAbstract t
     R.VarP i -> do
-      (x, t) <- mkVar i
-      annotatePattern i t $ A.VarP $ A.mkBindName x
+      (x, _t) <- mkVar i
+      return $ A.VarP $ A.mkBindName x
     R.LitP l  -> return $ A.LitP patNoRange l
-    R.AbsurdP i -> do
-      (_, t) <- mkVar i
-      annotatePattern i t $ A.AbsurdP patNoRange
+    R.AbsurdP _i -> return $ A.AbsurdP patNoRange
     R.ProjP d -> return $ A.ProjP patNoRange ProjSystem $ unambiguous $ killRange d
 
 instance ToAbstract (QNamed R.Clause) where
@@ -306,9 +299,11 @@ checkClauseTelescopeBindings :: MonadReflectedToAbstract m => [(Text, Arg R.Type
 checkClauseTelescopeBindings tel pats =
   case reverse [ x | ((x, _), i) <- zip (reverse tel) [0..], not $ Set.member i bs ] of
     [] -> return ()
-    xs -> genericDocError $ (singPlural xs id (<> "s") "Missing bindings for telescope variable") <?>
-                              (fsep (punctuate ", " $ map (text . Text.unpack) xs) <> ".") $$
-                             "All variables in the clause telescope must be bound in the left-hand side."
+    xs -> genericDocError $ vcat
+      [ fsep (pwords "Missing bindings for telescope" ++ [ pluralS xs "variable" ])
+        <?> (fsep (punctuate ", " $ map (text . Text.unpack) xs) <> ".")
+      , "All variables in the clause telescope must be bound in the left-hand side."
+      ]
   where
     bs = boundVars pats
 

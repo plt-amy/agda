@@ -44,7 +44,8 @@ import qualified Agda.TypeChecking.Monad.Benchmark as Bench
 import {-# SOURCE #-} Agda.TypeChecking.Monad.Options
   (getIncludeDirs, libToTCM)
 import Agda.TypeChecking.Monad.State (topLevelModuleName)
-import Agda.TypeChecking.Warnings (runPM, warning)
+import Agda.TypeChecking.Monad.Trace (runPM, setCurrentRange)
+import Agda.TypeChecking.Warnings    (warning)
 
 import Agda.Version ( version )
 
@@ -52,7 +53,9 @@ import Agda.Utils.Applicative ( (?$>) )
 import Agda.Utils.FileName
 import Agda.Utils.List  ( stripSuffix, nubOn )
 import Agda.Utils.List1 ( List1, pattern (:|) )
+import Agda.Utils.List2 ( List2, pattern List2 )
 import qualified Agda.Utils.List1 as List1
+import qualified Agda.Utils.List2 as List2
 import Agda.Utils.Monad ( ifM, unlessM )
 import Agda.Syntax.Common.Pretty ( Pretty(..), prettyShow )
 import qualified Agda.Syntax.Common.Pretty as P
@@ -92,24 +95,23 @@ toIFile (SourceFile src) = do
   mroot <- libToTCM $ findProjectRoot (takeDirectory fp)
   case mroot of
     Nothing   -> pure localIFile
-    Just root ->
+    Just root -> do
       let buildDir = root </> "_build" </> version </> "agda"
-          fileName = makeRelative root (filePath localIFile)
-          separatedIFile = mkAbsolute $ buildDir </> fileName
+      fileName <- liftIO $ makeRelativeCanonical root (filePath localIFile)
+      let separatedIFile = mkAbsolute $ buildDir </> fileName
           ifilePreference = ifM (optLocalInterfaces <$> commandLineOptions)
             (pure (localIFile, separatedIFile))
             (pure (separatedIFile, localIFile))
-      in do
-        separatedIFileExists <- liftIO $ doesFileExistCaseSensitive $ filePath separatedIFile
-        localIFileExists <- liftIO $ doesFileExistCaseSensitive $ filePath localIFile
-        case (separatedIFileExists, localIFileExists) of
-          (False, False) -> fst <$> ifilePreference
-          (False, True) -> pure localIFile
-          (True, False) -> pure separatedIFile
-          (True, True) -> do
-            ifiles <- ifilePreference
-            warning $ uncurry DuplicateInterfaceFiles ifiles
-            pure $ fst ifiles
+      separatedIFileExists <- liftIO $ doesFileExistCaseSensitive $ filePath separatedIFile
+      localIFileExists <- liftIO $ doesFileExistCaseSensitive $ filePath localIFile
+      case (separatedIFileExists, localIFileExists) of
+        (False, False) -> fst <$> ifilePreference
+        (False, True) -> pure localIFile
+        (True, False) -> pure separatedIFile
+        (True, True) -> do
+          ifiles <- ifilePreference
+          warning $ uncurry DuplicateInterfaceFiles ifiles
+          pure $ fst ifiles
 
 replaceModuleExtension :: String -> AbsolutePath -> AbsolutePath
 replaceModuleExtension ext@('.':_) = mkAbsolute . (++ ext) .  dropAgdaExtension . filePath
@@ -123,20 +125,17 @@ data FindError
   = NotFound [SourceFile]
     -- ^ The file was not found. It should have had one of the given
     -- file names.
-  | Ambiguous [SourceFile]
+  | Ambiguous (List2 SourceFile)
     -- ^ Several matching files were found.
-    --
-    -- Invariant: The list of matching files has at least two
-    -- elements.
   deriving Show
 
 -- | Given the module name which the error applies to this function
 -- converts a 'FindError' to a 'TypeError'.
 
 findErrorToTypeError :: TopLevelModuleName -> FindError -> TypeError
-findErrorToTypeError m (NotFound  files) = FileNotFound m (map srcFilePath files)
-findErrorToTypeError m (Ambiguous files) =
-  AmbiguousTopLevelModuleName m (map srcFilePath files)
+findErrorToTypeError m = \case
+  NotFound  files -> FileNotFound m $ map srcFilePath files
+  Ambiguous files -> AmbiguousTopLevelModuleName m $ fmap srcFilePath files
 
 -- | Finds the source file corresponding to a given top-level module
 -- name. The returned paths are absolute.
@@ -164,8 +163,8 @@ findFile' m = do
 
 -- | A variant of 'findFile'' which does not require 'TCM'.
 
-findFile''
-  :: [AbsolutePath]
+findFile'' ::
+     List1 AbsolutePath
   -- ^ Include paths.
   -> TopLevelModuleName
   -> ModuleToSource
@@ -176,17 +175,17 @@ findFile'' dirs m modFile =
     Just f  -> return (Right (SourceFile f), modFile)
     Nothing -> do
       files          <- fileList acceptableFileExts
-      filesShortList <- fileList parseFileExtsShortList
+      filesShortList <- fileList $ List2.toList parseFileExtsShortList
       existingFiles  <-
         liftIO $ filterM (doesFileExistCaseSensitive . filePath . srcFilePath) files
       return $ case nubOn id existingFiles of
         []     -> (Left (NotFound filesShortList), modFile)
         [file] -> (Right file, Map.insert m (srcFilePath file) modFile)
-        files  -> (Left (Ambiguous existingFiles), modFile)
+        f0:f1:fs -> (Left (Ambiguous $ List2 f0 f1 fs), modFile)
   where
     fileList exts = mapM (fmap SourceFile . absolute)
                     [ filePath dir </> file
-                    | dir  <- dirs
+                    | dir  <- List1.toList dirs
                     , file <- map (moduleNameToFileName m) exts
                     ]
 
@@ -231,7 +230,7 @@ checkModuleName name (SourceFile file) mexpected = do
         Just expected -> ModuleNameUnexpected name expected
 
     Left (Ambiguous files) -> typeError $
-      AmbiguousTopLevelModuleName name (map srcFilePath files)
+      AmbiguousTopLevelModuleName name $ fmap srcFilePath files
 
     Right src -> do
       let file' = srcFilePath src
@@ -270,7 +269,7 @@ moduleName file parsedModule = billTo [Bench.ModuleName] $ do
   let defaultName = rootNameModule file
       raw         = rawTopLevelModuleNameForModule parsedModule
   topLevelModuleName =<< if isNoName raw
-    then do
+    then setCurrentRange (rangeFromAbsolutePath file) do
       m <- runPM (fst <$> parse moduleNameParser defaultName)
              `catchError` \_ ->
            typeError $ InvalidFileName file DoesNotCorrespondToValidModuleName
@@ -285,8 +284,8 @@ moduleName file parsedModule = billTo [Bench.ModuleName] $ do
             }
     else return raw
 
-parseFileExtsShortList :: [String]
-parseFileExtsShortList = ".agda" : literateExtsShortList
+parseFileExtsShortList :: List2 String
+parseFileExtsShortList = List2.cons ".agda" literateExtsShortList
 
 dropAgdaExtension :: String -> String
 dropAgdaExtension s = case catMaybes [ stripSuffix ext s

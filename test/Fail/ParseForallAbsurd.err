@@ -1,6 +1,4 @@
-ParseForallAbsurd.agda:5,22-22
-ParseForallAbsurd.agda:5,22: Parse error
-)<ERROR>
- -> Set1
+ParseForallAbsurd.agda:5.22: error: [ParseError]
+)<ERROR>  -> Set1
 parseFails x = Set
 --...

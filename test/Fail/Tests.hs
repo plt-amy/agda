@@ -20,6 +20,7 @@ import Test.Tasty.Silver.Advanced
 import Utils
 
 import Agda.Utils.Functor ((<&>), for)
+import Test.Tasty.Silver.Filter (RegexFilter (RFInclude))
 
 testDir :: FilePath
 testDir = "test" </> "Fail"
@@ -40,7 +41,6 @@ tests = do
     [ testGroup "customised" $
         issue6465 :
         issue5508 :
-        issue5101 :
         issue4671 :
         issue2649 :
         nestedProjectRoots :
@@ -94,6 +94,30 @@ caseInsensitiveFileSystem4671 = do
     goldenFileSens    = dir </> "Issue4671.err.case-sensitive"
     goldenFileInsens  = dir </> "Issue4671.err.case-insensitive"
     goldenFileInsens' = dir </> "Issue4671.err.cAsE-inSensitive" -- case variant, to test file system
+
+
+-- | Filtering out fail-tests that require Agda built with -fdebug.
+
+fdebugTestFilter :: [RegexFilter]
+fdebugTestFilter =
+-- This list was crafted using
+--    grep -RP '(?<!-- ){-# OPTIONS.* -v' | grep Fail/
+--  and screening the results (e.g. for comments)
+  [ disable "Fail/Issue3590-2"
+  , disable "Fail/IndexInference"
+  , disable "Fail/DebugWith"
+  , disable "Fail/ImpossibleVerbose"
+  , disable "Fail/ConstructorHeadedPointlessForRecordPatterns"
+  , disable "Fail/Issue3590-1"
+  , disable "Fail/Issue1303"
+  , disable "Fail/ImpossibleVerboseReduceM"
+  , disable "Fail/Issue2018debug"
+  , disable "Fail/Issue1963DisplayWithPostfixCopattern"
+  , disable "Fail/Optimised-open"
+  , disable "Fail/Optimised-open"
+  , disable "Fail/Issue4175"
+  ]
+  where disable = RFInclude
 
 issue6465 :: TestTree
 issue6465 =
@@ -164,29 +188,6 @@ issue5508 =
       let agdaArgs file = [ "-v0", "--no-libraries", "-i" ++ dir, dir </> file ]
       runAgdaWithOptions "iSSue5508" (agdaArgs "iSSue5508.agda") Nothing Nothing
         <&> printTestResult . expectFail
-
--- The only customization here is that these do not have input .agda files,
--- because the front-end interactors do not accept them.
--- This runs the same as a normal test, but won't be auto-discovered because
--- currently test discovery searches only for the .agda source.
-issue5101 :: TestTree
-issue5101 = testGroup "Issue5101" $
-  for suffixes $ \s -> do
-    let testName = "OnlyScopeChecking" ++ s
-    let goldenFile = dir </> testName <.> "err"
-    let flagsFile = dir </> testName <.> "flags"
-    let agdaArgs = ["-v0", "--no-libraries", "-i" ++ dir]
-    let doRun = runAgdaWithOptions testName agdaArgs (Just flagsFile) Nothing <&> printTestResult . expectFail
-    goldenTest1
-      testName
-      (readTextFileMaybe goldenFile)
-      doRun
-      textDiff
-      ShowText
-      (writeTextFile goldenFile)
-  where
-  dir = testDir
-  suffixes = ["Repl", "Emacs", "JSON", "Vim"]
 
 issue2649 :: TestTree
 issue2649 =

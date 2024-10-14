@@ -1,9 +1,10 @@
+{-# LANGUAGE CPP #-}
+
 {-# OPTIONS_GHC -Wunused-imports #-}
 
 ------------------------------------------------------------------------
 -- | An interface for reporting \"impossible\" errors
 ------------------------------------------------------------------------
-
 
 module Agda.Utils.Impossible where
 
@@ -14,6 +15,7 @@ import Agda.Utils.CallStack.Base
     , HasCallStack
     , prettyCallStack
     , withCallerCallStack
+    , withNBackCallStack
     )
 
 -- | \"Impossible\" errors, annotated with a file name and a line
@@ -59,7 +61,14 @@ instance Show Impossible where
     , unwords needed
     ]
 
-instance Exception Impossible
+instance Exception Impossible where
+#if MIN_VERSION_base(4,20,0)
+  -- Andreas, 2024-07-05, issue #7299;
+  -- Turn off the (here useless) backtrace introduced in GHC 9.10.
+  -- Besides spamming us with useless info, it changes the golden
+  -- value, introducing incompatibilities in the test-suite.
+  backtraceDesired _ = False
+#endif
 
 -- | Abort by throwing an \"impossible\" error. You should not use
 -- this function directly. Instead use __IMPOSSIBLE__
@@ -92,13 +101,21 @@ class CatchImpossible m where
 instance CatchImpossible IO where
   catchImpossibleJust = catchJust
 
--- | Throw an "Impossible" error reporting the *caller's* call site.
-
-__IMPOSSIBLE__ :: HasCallStack => a
-__IMPOSSIBLE__ = withCallerCallStack $ throwImpossible . Impossible
-
+-- | Construct a value of 'Impossible' reporting the location where you call
+--   this function.
 impossible :: HasCallStack => Impossible
 impossible = withCallerCallStack Impossible
+
+-- | Throw an 'Impossible' error reporting the location where you
+--   place '__IMPOSSIBLE__'.
+
+__IMPOSSIBLE__ :: HasCallStack => a
+__IMPOSSIBLE__ = withNBackCallStack 0 $ throwImpossible . Impossible
+
+-- | Throw an 'Impossible' error reporting the *caller's* call site.
+
+__IMPOSSIBLE__1 :: HasCallStack => a
+__IMPOSSIBLE__1 = withNBackCallStack 1 $ throwImpossible . Impossible
 
 -- | Throw an "Unreachable" error reporting the *caller's* call site.
 -- Note that this call to "withFileAndLine" will be filtered out

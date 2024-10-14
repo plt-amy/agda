@@ -75,7 +75,7 @@ variable rule:
 
 module Agda.TypeChecking.Irrelevance where
 
-import Control.Monad.Except
+import Control.Monad.Except ( MonadError(..), runExceptT )
 
 import Agda.Syntax.Common
 import Agda.Syntax.Internal
@@ -84,6 +84,7 @@ import Agda.TypeChecking.Monad
 import Agda.TypeChecking.Pretty
 import Agda.TypeChecking.Reduce
 import Agda.TypeChecking.Substitute.Class
+import Agda.TypeChecking.Telescope
 
 import Agda.Utils.Lens
 import Agda.Utils.Maybe
@@ -330,6 +331,12 @@ isIrrelevantOrPropM
   :: (LensRelevance a, LensSort a, PrettyTCM a, PureTCM m, MonadBlock m)
   => a -> m Bool
 isIrrelevantOrPropM x = return (isIrrelevant x) `or2M` isPropM x
+
+allIrrelevantOrPropTel
+  :: (PureTCM m, MonadBlock m)
+  => Telescope -> m Bool
+allIrrelevantOrPropTel =
+  foldrTelescopeM (and2M . isIrrelevantOrPropM . fmap snd) (return True)
 
 -- * Fibrant types
 

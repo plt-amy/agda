@@ -1,5 +1,4 @@
 {-# LANGUAGE CPP #-}
-{-# LANGUAGE ViewPatterns #-}
 
 -- | Function for generating highlighted and aligned LaTeX from literate
 -- Agda source.
@@ -24,7 +23,6 @@ import Data.Function (on)
 import Data.Foldable (toList)
 
 import Control.Exception.Base (IOException, try)
-import Control.Monad (forM_, mapM_, unless, when)
 import Control.Monad.Trans.Reader as R ( ReaderT(runReaderT))
 import Control.Monad.RWS.Strict
   ( RWST(runRWST)

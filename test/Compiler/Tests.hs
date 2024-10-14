@@ -41,12 +41,17 @@ data ExecResult
   deriving (Show, Read, Eq)
 
 data CodeOptimization = NonOptimized | Optimized | MinifiedOptimized
-  deriving (Show, Read, Eq)
+  deriving (Show, Read, Eq, Enum, Bounded)
 
 data Strict = Strict | StrictData | Lazy
-  deriving (Show, Read, Eq)
+  deriving (Show, Read, Eq, Enum, Bounded)
 
-data Compiler = MAlonzo Strict | JS CodeOptimization
+data JSModuleStyle = ES6 | CJS | AMD
+  deriving (Show, Read, Eq, Enum, Bounded)
+
+data Compiler
+  = MAlonzo Strict
+  | JS JSModuleStyle CodeOptimization
   deriving (Show, Read, Eq)
 
 data CompilerOptions
@@ -62,9 +67,9 @@ data TestOptions
     } deriving (Show, Read)
 
 allCompilers :: [Compiler]
-allCompilers =
-  map MAlonzo [Lazy, StrictData, Strict] ++
-  map JS [NonOptimized, Optimized, MinifiedOptimized]
+allCompilers
+  =  [ MAlonzo strict | strict <- [Lazy, StrictData, Strict]]
+  ++ [ JS style opt   | opt <- [minBound..], style <- [minBound..] ]
 
 defaultOptions :: TestOptions
 defaultOptions = TestOptions
@@ -111,6 +116,24 @@ disabledTests =
   ]
   where disable = RFInclude
 
+-- | Filtering out compiler tests that require Agda built with -fdebug.
+
+fdebugTestFilter :: [RegexFilter]
+fdebugTestFilter =
+-- This list was crafted using
+--    grep -RP '(?<!-- ){-# OPTIONS.* -v' | grep Compiler/
+--  and screening the results (e.g. for comments)
+  [ disable "Compiler/simple/UnusedArguments"
+  , disable "Compiler/simple/EraseRefl"
+  , disable "Compiler/simple/InlineRecursive"
+  , disable "Compiler/simple/Word"
+  , disable "Compiler/simple/CompileNumbers"
+  , disable "Compiler/simple/CaseOnCase"
+  , disable "Compiler/simple/CompareNat"
+  , disable "Compiler/simple/CompileCatchAll"
+  ]
+  where disable = RFInclude
+
 -- | Filtering out compiler tests using the Agda standard library.
 
 stdlibTestFilter :: [RegexFilter]
@@ -131,9 +154,10 @@ tests = do
         | s <- [Lazy, StrictData] ++
                [Strict | ghcVersionAtLeast9]
         ] ++
-        [ JS opt
+        [ JS style opt
         | isJust nodeBin
-        , opt <- [NonOptimized, Optimized, MinifiedOptimized]
+        , opt   <- [minBound..]
+        , style <- [CJS,ES6]
         ]
   _ <- case nodeBin of
     Nothing -> putStrLn "No JS node binary found, skipping JS tests."
@@ -295,10 +319,15 @@ agdaRunProgGoldenTest1 dir comp extraArgs inp opts cont
           Lazy       -> []
           StrictData -> ["--ghc-strict-data"]
           Strict     -> ["--ghc-strict"]
-        argsForComp (JS o)  = [ "--js", "--js-verify" ] ++ case o of
-          NonOptimized      -> []
-          Optimized         -> [ "--js-optimize" ]
-          MinifiedOptimized -> [ "--js-optimize", "--js-minify" ]
+        argsForComp (JS style opt) = [ "--js", "--js-verify" ]
+          ++ case style of
+            ES6 -> ["--js-es6"]
+            AMD -> ["--js-amd"]
+            CJS -> ["--js-cjs"]
+          ++ case opt of
+            NonOptimized      -> []
+            Optimized         -> [ "--js-optimize" ]
+            MinifiedOptimized -> [ "--js-optimize", "--js-minify" ]
 
         removePaths ps = \case
           CompileFailed    r -> CompileFailed    (removePaths' r)
@@ -326,7 +355,9 @@ cleanUpOptions = filter clean
 
 -- gets the generated executable path
 getExecForComp :: Compiler -> FilePath -> FilePath -> FilePath
-getExecForComp JS{} compDir inpFile = compDir </> ("jAgda." ++ takeFileName (dropAgdaOrOtherExtension inpFile) ++ ".js")
+getExecForComp (JS style opt) compDir inpFile
+  = compDir </> ("jAgda." ++ takeFileName (dropAgdaOrOtherExtension inpFile) ++ ext)
+    where ext = if style == ES6 then ".mjs" else ".js"
 getExecForComp _ compDir inpFile = compDir </> takeFileName (dropAgdaOrOtherExtension inpFile)
 
 printExecResult :: ExecResult -> T.Text

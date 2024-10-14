@@ -28,7 +28,7 @@
 
 ;;; Code:
 
-(defvar agda2-version "2.6.5"
+(defvar agda2-version "2.8.0"
   "The version of the Agda mode.
 Note that the same version of the Agda executable must be used.")
 
@@ -952,7 +952,7 @@ The buffer is returned.")
       (compilation-mode "AgdaInfo")
       ;; Support for jumping to positions mentioned in the text.
       (set (make-local-variable 'compilation-error-regexp-alist)
-           '(("\\([\\\\/][^[:space:]]*\\):\\([0-9]+\\),\\([0-9]+\\)-\\(\\([0-9]+\\),\\)?\\([0-9]+\\)"
+           '(("\\([\\\\/][^[:space:]]*\\):\\([0-9]+\\)\\.\\([0-9]+\\)-\\(\\([0-9]+\\)\\.\\)?\\([0-9]+\\)"
               1 (2 . 5) (3 . 6))))
       ;; Do not skip errors that start in the same position as the
       ;; current one.
@@ -1382,7 +1382,7 @@ Either only one if point is a goal, or all of them."
   agda2-mimer
   "Run proof search on a goal."
   "Cmd_autoOne"
-  nil
+  'goal
 )
 
 (agda2-maybe-normalised-toplevel-asis-noprompt

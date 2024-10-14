@@ -1,6 +1,4 @@
-ConflictingRelevance.agda:4,34-34
-ConflictingRelevance.agda:4,34: Parse error
-)<ERROR>
- → A
+ConflictingRelevance.agda:4.34: error: [ParseError]
+)<ERROR>  → A
 
 -- Should fail.  (Curren...

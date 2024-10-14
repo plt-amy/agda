@@ -150,14 +150,14 @@ instance NamesIn Bool where
 
 instance NamesIn Definition where
   namesAndMetasIn' sg
-    (Defn _ _ t _ _ _ _ disp _ _ _ _ _ _ _ _ _ _ def) =
+    (Defn _ _ t _ _ _ disp _ _ _ _ _ _ _ _ _ _ def) =
     namesAndMetasIn' sg (t, def, disp)
 
 instance NamesIn Defn where
   namesAndMetasIn' sg = \case
     Axiom _            -> mempty
     DataOrRecSig _     -> mempty
-    GeneralizableVar   -> mempty
+    GeneralizableVar _ -> mempty
     PrimitiveSort _ s  -> namesAndMetasIn' sg s
     AbstractDefn{}     -> __IMPOSSIBLE__
     -- Andreas 2017-07-27, Q: which names can be in @cc@ which are not already in @cl@?
@@ -173,7 +173,7 @@ instance NamesIn Defn where
       -> namesAndMetasIn' sg (cl, cc)
 
 instance NamesIn Clause where
-  namesAndMetasIn' sg (Clause _ _ tel ps b t _ _ _ _ _ _) =
+  namesAndMetasIn' sg (Clause _ _ tel ps b t _ _ _ _ _) =
     namesAndMetasIn' sg (tel, ps, b, t)
 
 instance NamesIn CompiledClauses where
@@ -192,7 +192,7 @@ instance NamesIn (Pattern' a) where
     VarP _ _        -> mempty
     LitP _ l        -> namesAndMetasIn' sg l
     DotP _ v        -> namesAndMetasIn' sg v
-    ConP c _ args   -> namesAndMetasIn' sg (c, args)
+    ConP c cpi args -> namesAndMetasIn' sg (c, cpi, args)
     DefP o q args   -> namesAndMetasIn' sg (q, args)
     ProjP _ f       -> namesAndMetasIn' sg f
     IApplyP _ t u _ -> namesAndMetasIn' sg (t, u)
@@ -373,6 +373,9 @@ newtype PSyn = PSyn A.PatternSynDefn
 instance NamesIn PSyn where
   namesAndMetasIn' sg (PSyn (_args, p)) = namesAndMetasIn' sg p
 
+instance NamesIn ConPatternInfo where
+  namesAndMetasIn' sg (ConPatternInfo _ _ _ ty _) = namesAndMetasIn' sg ty
+
 instance NamesIn (A.Pattern' a) where
   namesAndMetasIn' sg = \case
     A.VarP _               -> mempty
@@ -388,7 +391,6 @@ instance NamesIn (A.Pattern' a) where
     A.DotP{}               -> __IMPOSSIBLE__    -- Dot patterns are not allowed in pattern synonyms
     A.EqualP{}             -> __IMPOSSIBLE__    -- Andrea: should we allow these in pattern synonyms?
     A.WithP _ p            -> namesAndMetasIn' sg p
-    A.AnnP _ a p           -> __IMPOSSIBLE__    -- Type annotations are not (yet) allowed in pattern synonyms
 
 instance NamesIn AmbiguousQName where
   namesAndMetasIn' sg (AmbQ cs) = namesAndMetasIn' sg cs

@@ -15,19 +15,17 @@ import Control.Concurrent.STM.TChan
 import Control.Concurrent.STM.TVar
 import qualified Control.Exception  as E
 
-import Control.Monad
 import Control.Monad.Except         ( MonadError(..), ExceptT(..), runExceptT )
 import Control.Monad.IO.Class       ( MonadIO(..) )
-import Control.Monad.Fail           ( MonadFail )
 import Control.Monad.State          ( MonadState(..), gets, modify, runStateT )
 import Control.Monad.STM
 import Control.Monad.State          ( StateT )
-import Control.Monad.Trans          ( lift )
 
 import qualified Data.Char as Char
 import Data.Function (on)
 import qualified Data.List as List
 import qualified Data.Map as Map
+import qualified Data.Set as Set
 import Data.Maybe
 
 import System.Directory
@@ -39,7 +37,7 @@ import qualified Agda.TypeChecking.Monad as TCM
 import qualified Agda.TypeChecking.Pretty as TCP
 import Agda.TypeChecking.Rules.Term (checkExpr, isType_)
 import Agda.TypeChecking.Errors
-import Agda.TypeChecking.Warnings (runPM, warning)
+import Agda.TypeChecking.Warnings (warning)
 
 import Agda.Syntax.Fixity
 import Agda.Syntax.Position
@@ -51,12 +49,12 @@ import Agda.Syntax.Abstract as A
 import Agda.Syntax.Abstract.Pretty
 import Agda.Syntax.Info (mkDefInfo)
 import Agda.Syntax.Translation.ConcreteToAbstract
-import Agda.Syntax.Translation.AbstractToConcrete hiding (withScope)
+import Agda.Syntax.Translation.AbstractToConcrete
 import Agda.Syntax.Scope.Base
 import Agda.Syntax.TopLevelModuleName
 
 import Agda.Interaction.Base
-import Agda.Interaction.ExitCode
+import Agda.Interaction.ExitCode (pattern TCMError, exitAgdaWith)
 import Agda.Interaction.FindFile
 import Agda.Interaction.Options
 import Agda.Interaction.Options.Lenses as Lenses
@@ -79,6 +77,7 @@ import Agda.Utils.Either
 import Agda.Utils.FileName
 import Agda.Utils.Function
 import Agda.Utils.Hash
+import Agda.Utils.IO (showIOException)
 import Agda.Utils.Lens
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Utils.Monad
@@ -191,7 +190,7 @@ getOldInteractionScope :: InteractionId -> CommandM ScopeInfo
 getOldInteractionScope ii = do
   ms <- gets $ Map.lookup ii . oldInteractionScopes
   case ms of
-    Nothing    -> fail $ "not an old interaction point: " ++ show ii
+    Nothing    -> __IMPOSSIBLE_VERBOSE__ $ "not an old interaction point: " ++ show ii
     Just scope -> return scope
 
 -- | Do setup and error handling for a command.
@@ -238,16 +237,18 @@ handleCommand wrap onFail cmd = handleNastyErrors $ wrap $ do
     -- AsyncCancelled, which is used to abort Agda.
     handleNastyErrors :: CommandM () -> CommandM ()
     handleNastyErrors m = commandMToIO $ \ toIO -> do
-      let handle e =
-            Right <$>
-              toIO (handleErr (Just Direct) $
-                        Exception noRange $ text $ E.displayException e)
 
-          asyncHandler e@AsyncCancelled = return (Left e)
+      let asyncHandler e@AsyncCancelled = return (Left e)
 
-          generalHandler (e :: E.SomeException) = handle e
+          ioHandler (e :: E.IOException) = Right <$> do
+            toIO $ handleErr (Just Direct) $ IOException Nothing noRange e
 
-      r <- ((Right <$> toIO m) `E.catch` asyncHandler)
+          generalHandler (e :: E.SomeException) = Right <$> do
+            toIO $ handleErr (Just Direct) $ GenericException $ showIOException e
+
+      r <- (Right <$> toIO m)
+             `E.catch` asyncHandler
+             `E.catch` ioHandler
              `E.catch` generalHandler
       case r of
         Right x -> return x
@@ -257,6 +258,11 @@ handleCommand wrap onFail cmd = handleNastyErrors $ wrap $ do
     -- error. Because this function may switch the focus to another file
     -- the status information is also updated.
     handleErr method e = do
+
+      -- TODO: make a better predicate for this
+      noError <- lift $ null <$> renderError e
+      unless noError do
+
         unsolved <- lift $ computeUnsolvedInfo
         err     <- lift $ errorHighlighting e
         modFile <- lift $ useTC stModuleToSource
@@ -266,12 +272,9 @@ handleCommand wrap onFail cmd = handleNastyErrors $ wrap $ do
         let info = convert $ err <> unsolved
                      -- Errors take precedence over unsolved things.
 
-        -- TODO: make a better predicate for this
-        noError <- lift $ null <$> renderError e
-
         showImpl <- lift $ optShowImplicit <$> useTC stPragmaOptions
         showIrr <- lift $ optShowIrrelevant <$> useTC stPragmaOptions
-        unless noError $ do
+        do
           mapM_ putResponse $
             [ Resp_DisplayInfo $ Info_Error $ Info_GenericError e ] ++
             tellEmacsToJumpToError (getRange e) ++
@@ -459,6 +462,7 @@ initialiseCommandQueue next = do
 
 independent :: Interaction -> Bool
 independent (Cmd_load {})                   = True
+independent Cmd_load_no_metas{}             = True
 independent (Cmd_compile {})                = True
 independent (Cmd_load_highlighting_info {}) = True
 independent Cmd_tokenHighlighting {}        = True
@@ -473,7 +477,7 @@ updateInteractionPointsAfter Cmd_load{}                          = True
 updateInteractionPointsAfter Cmd_compile{}                       = True
 updateInteractionPointsAfter Cmd_constraints{}                   = False
 updateInteractionPointsAfter Cmd_metas{}                         = False
-updateInteractionPointsAfter Cmd_no_metas{}                      = False
+updateInteractionPointsAfter Cmd_load_no_metas{}                 = False
 updateInteractionPointsAfter Cmd_show_module_contents_toplevel{} = False
 updateInteractionPointsAfter Cmd_search_about_toplevel{}         = False
 updateInteractionPointsAfter Cmd_solveAll{}                      = True
@@ -521,16 +525,16 @@ interpret (Cmd_load m argv) =
 
 interpret (Cmd_compile backend file argv) =
   cmd_load' file argv allowUnsolved mode $ \ checkResult -> do
-    mw <- lift $ applyFlagsToTCWarnings $ crWarnings checkResult
-    case mw of
-      [] -> do
+    ws <- lift $ applyFlagsToTCWarnings $ crWarnings checkResult
+    case null ws of
+      True -> do
         lift $ case backend of
           LaTeX                    -> callBackend "LaTeX" IsMain checkResult
           QuickLaTeX               -> callBackend "LaTeX" IsMain checkResult
           OtherBackend "GHCNoMain" -> callBackend "GHC" NotMain checkResult   -- for backwards compatibility
           OtherBackend b           -> callBackend b IsMain checkResult
         display_info . Info_CompilationOk backend =<< lift B.getWarningsAndNonFatalErrors
-      w@(_:_) -> display_info $ Info_Error $ Info_CompilationError w
+      False -> display_info $ Info_Error $ Info_CompilationError ws
   where
   allowUnsolved = backend `elem` [LaTeX, QuickLaTeX]
   mode | QuickLaTeX <- backend = ScopeCheck
@@ -543,10 +547,12 @@ interpret (Cmd_metas norm) = do
   ms <- lift $ B.getGoals' norm (max Simplified norm)
   display_info . Info_AllGoalsWarnings ms =<< lift B.getWarningsAndNonFatalErrors
 
-interpret Cmd_no_metas = do
-  metas <- getOpenMetas
-  unless (null metas) $
-    typeError $ GenericError "Unsolved meta-variables"
+interpret (Cmd_load_no_metas file) = do
+  -- Fail if there are open metas.
+  let allowMetas = False
+  cmd_load' file [] allowMetas TypeCheck $ \ result -> do
+    Imp.raiseNonFatalErrors result
+    unlessM (null <$> getOpenMetas) __IMPOSSIBLE__
 
 interpret (Cmd_show_module_contents_toplevel norm s) =
   atTopLevel $ showModuleContents norm noRange s
@@ -875,17 +881,11 @@ cmd_load'
                -- ^ Continuation after successful loading.
   -> CommandM a
 cmd_load' file argv unsolvedOK mode cmd = do
-    fp <- liftIO $ absolute file
-    ex <- liftIO $ doesFileExist $ filePath fp
-    unless ex $ typeError $ GenericError $
-      "The file " ++ file ++ " was not found."
 
     -- Forget the previous "current file" and interaction points.
     modify $ \ st -> st { theInteractionPoints = []
                         , theCurrentFile       = Nothing
                         }
-
-    t <- liftIO $ getModificationTime file
 
     -- Update the status. Because the "current file" is not set the
     -- status is not "Checked".
@@ -906,7 +906,15 @@ cmd_load' file argv unsolvedOK mode cmd = do
     -- Parse the file.
     --
     -- Note that options are set below.
+    fp  <- liftIO $ absolute file
     src <- lift $ Imp.parseSource (SourceFile fp)
+    -- Andreas, 2024-08-03, see test/interaction/FileNotFound:
+    -- Run 'getModificationTime' after 'parseSource',
+    -- otherwise the user gets a weird error for non-existing files.
+    -- (We assume that parsing is fast in comparison to type-checking,
+    -- so it should not matter much whether we get the time stamp
+    -- before or after parsing.)
+    t   <- liftIO $ getModificationTime file
 
     -- Store the warnings.
     warnings <- useTC stTCWarnings
@@ -918,7 +926,7 @@ cmd_load' file argv unsolvedOK mode cmd = do
     let (z, warns) = runOptM $ parseBackendOptions backends argv opts0
     mapM_ (lift . warning . OptionWarning) warns
     case z of
-      Left err -> lift $ typeError $ GenericError err
+      Left err -> lift $ typeError $ OptionError err
       Right (_, opts) -> do
         opts <- lift $ addTrustedExecutables opts
         let update = over (lensOptAllowUnsolved . lensKeepDefault) (unsolvedOK &&)
@@ -926,7 +934,7 @@ cmd_load' file argv unsolvedOK mode cmd = do
         lift $ TCM.setCommandLineOptions' root $ mapPragmaOptions update opts
 
     -- Restore the warnings that were saved above.
-    modifyTCLens stTCWarnings (++ warnings)
+    modifyTCLens stTCWarnings $ Set.union warnings
 
     ok <- lift $ Imp.typeCheckMain mode src
 
@@ -1071,7 +1079,7 @@ highlightExpr e =
 -- | Sorts interaction points based on their ranges.
 
 sortInteractionPoints
-  :: (MonadInteractionPoints m, MonadError TCErr m, MonadFail m)
+  :: (MonadInteractionPoints m, MonadError TCErr m, MonadDebug m)
   => [InteractionId] -> m [InteractionId]
 sortInteractionPoints is =
   map fst . List.sortBy (compare `on` snd) <$> do

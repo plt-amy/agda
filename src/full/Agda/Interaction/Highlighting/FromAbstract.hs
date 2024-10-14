@@ -196,6 +196,11 @@ instance (Hilite a, Hilite b) => Hilite (a, b) where
 instance Hilite A.RecordDirectives where
   hilite (RecordDirectives _ _ _ c) = hilite c
 
+instance Hilite A.RecordConName where
+  hilite = \case
+    A.NamedRecCon x -> hilite x
+    A.FreshRecCon{} -> mempty
+
 instance Hilite A.Declaration where
   hilite = \case
       A.Axiom _ax _di ai _occ x e            -> hl ai <> hl x <> hl e
@@ -290,7 +295,6 @@ instance (Hilite a, IsProjP a) => Hilite (A.Pattern' a) where
       A.RecP _r ps           -> hl ps
       A.EqualP _r ps         -> hl ps
       A.WithP _ p            -> hl p
-      A.AnnP _r a p          -> hl p
 
     where
     hl a = hilite a

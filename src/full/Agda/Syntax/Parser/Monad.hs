@@ -45,6 +45,7 @@ import Agda.Syntax.Concrete.Attribute
 import Agda.Syntax.Position
 import Agda.Syntax.Parser.Tokens ( Keyword( KwMutual ) )
 
+import Agda.Utils.IO   ( showIOException )
 import Agda.Utils.List ( tailWithDefault )
 import qualified Agda.Utils.Maybe.Strict as Strict
 import Agda.Syntax.Common.Pretty
@@ -163,6 +164,13 @@ data ParseError
     }
   deriving Show
 
+instance NFData ParseError where
+  rnf = \case
+    ParseError _f _r inp tok msg  -> rnf inp `seq` rnf tok `seq` rnf msg
+    OverlappingTokensError _r     -> ()
+    InvalidExtensionError _r exts -> rnf exts
+    ReadFileError _r _err         -> ()
+
 -- | Warnings for parsing.
 data ParseWarning
   -- | Parse errors that concern a range in a file.
@@ -223,23 +231,25 @@ parseWarning w =
 
 instance Pretty ParseError where
   pretty ParseError{errPos,errSrcFile,errMsg,errPrevToken,errInput} = vcat
-      [ (pretty (errPos { srcFile = errSrcFile }) <> colon) <+>
-        text errMsg
-      , text $ errPrevToken ++ "<ERROR>"
-      , text $ take 30 errInput ++ "..."
+      [ (pretty errPos{ srcFile = errSrcFile } <> colon) <+> "error: [ParseError]"
+      , if not $ null errMsg then text errMsg else sep
+          -- Happy errors have no message, so we print the context instead
+          [ text $ errPrevToken ++ "<ERROR>"
+          , text $ take 30 errInput ++ "..."
+          ]
       ]
   pretty OverlappingTokensError{errRange} = vcat
-      [ (pretty errRange <> colon) <+>
-        "Multi-line comment spans one or more literate text blocks."
+      [ (pretty errRange <> colon) <+> "error: [OverlappingTokensError]"
+      , "Multi-line comment spans one or more literate text blocks."
       ]
   pretty InvalidExtensionError{errPath,errValidExts} = vcat
-      [ (pretty errPath <> colon) <+>
-        "Unsupported extension."
+      [ (pretty errPath <> colon) <+> "error: [InvalidExtensionError]"
+      , "Unsupported extension."
       , "Supported extensions are:" <+> prettyList_ errValidExts
       ]
   pretty ReadFileError{errPath,errIOError} = vcat
       [ "Cannot read file" <+> pretty errPath
-      , "Error:" <+> text (displayException errIOError)
+      , "Error:" <+> text (showIOException errIOError)
       ]
 
 instance HasRange ParseError where
@@ -252,23 +262,24 @@ instance HasRange ParseError where
     errPathRange = posToRange p p
       where p = startPos $ Just $ errPath err
 
+-- | Does not include printing of the range.
+--
 instance Pretty ParseWarning where
-  pretty OverlappingTokensWarning{warnRange} = vcat
-      [ (pretty warnRange <> colon) <+>
-        "Multi-line comment spans one or more literate text blocks."
+  pretty = \case
+
+    OverlappingTokensWarning _r ->
+      "Multi-line comment spans one or more literate text blocks."
+
+    UnsupportedAttribute _r ms -> hsep
+      [ case ms of
+          Nothing -> "Attributes"
+          Just s  -> text s <+> "attributes"
+      , "are not supported here."
       ]
-  pretty (UnsupportedAttribute r s) = vcat
-    [ (pretty r <> colon) <+>
-      (case s of
-         Nothing -> "Attributes"
-         Just s  -> text s <+> "attributes") <+>
-      "are not supported here."
-    ]
-  pretty (MultipleAttributes r s) = vcat
-    [ (pretty r <> colon) <+>
-      "Multiple" <+>
-      maybe id (\s -> (text s <+>)) s "attributes (ignored)."
-    ]
+
+    MultipleAttributes _r ms -> hsep
+      [ "Multiple", pretty ms, "attributes (ignored)." ]
+
 
 instance HasRange ParseWarning where
   getRange OverlappingTokensWarning{warnRange} = warnRange

@@ -1,4 +1,4 @@
-Release notes for Agda version 2.6.5
+Release notes for Agda version 2.8.0
 ====================================
 
 Highlights
@@ -7,139 +7,112 @@ Highlights
 Installation
 ------------
 
-* Agda supports GHC versions 8.6.5 to 9.8.2.
+* Dropped support for GHC 8.6.
+* Agda supports GHC versions 8.8.4 to 9.10.1.
 
 Pragmas and options
 -------------------
 
-* The following options are now considered infective:
-  ([Issue #5264](https://github.com/agda/agda/issues/5264))
+* New warning `InvalidDisplayForm` instead of hard error
+  when a display form is illegal (and thus ignored).
 
-  * `--allow-exec`
-  * `--cumulativity`
-  * `--experimental-irrelevance`
-  * `--injective-type-constructors`
-  * `--omega-in-omega`
-  * `--rewriting`
-  * `--type-in-type`
-
-  This means that if a module has one of these flags enabled,
-  then all modules importing it must also have that flag enabled.
-
-* New warning `UselessMacro` when a `macro` block does not contain any function definitions.
-
-* New warning `ConflictingPragmaOptions` if giving both `--this` and `--that`
-  when `--this` implies `--no-that` (and analogous for `--no-this` implies
-  `--that`, etc).
-
-* [**Breaking**] The option `--overlapping-instances`, which allows
-  backtracking during instance search, has been renamed to
-  `--backtracking-instance-search`.
-
-* New warning `WarningProblem` when trying to switch an unknown or non-benign warning with the `-W` option.
-  Used to be a hard error.
-
-* New option `--require-unique-meta-solutions` (turned on by default). Disabling it with
-  `--no-require-unique-meta-solutions` allows the type checker to take advantage of `INJECTIVE_FOR_INFERENCE` pragmas
-  (see below). The `--lossy-unification` flag implies `--no-require-unique-meta-solutions`.
-
-* New pragma `INJECTIVE_FOR_INFERENCE`, which treats functions as injective for inferring implicit arguments if
-  `--no-require-unique-meta-solutions` is given. The `--no-require-unique-meta-solutions` flag needs to be given in the
-  file where the function is used, and not necessarily in the file where it is defined.
-  For example:
+* New warning `UnusedVariablesInDisplayForm` when DISPLAY pragma
+  binds variables that are not used.
+  Example:
   ```agda
-  postulate
-    reverse-≡ : {l l' : List A} → reverse l ≡ reverse l' → reverse l ≡ reverse l'
-
-  []≡[] : [] ≡ []
-  []≡[] = reverse-≡ (refl {x = reverse []})
+  {-# DISPLAY List (Fin n) = ListFin #-}
   ```
-  does not work since Agda won't solve `l` and `l'` for `[]`, even though it knows `reverse l = reverse []`.
-  If `reverse` is marked as injective with `{-# INJECTIVE_FOR_INFERENCE reverse #-}` this example will work.
+  Since pattern variable `n` is not used on the right hand side `ListFin`,
+  Agda throws a warning and recommeds to rewrite it as:
+  ```agda
+  {-# DISPLAY List (Fin _) = ListFin #-}
+  ```
+
+* New warning `WithClauseProjectionFixityMismatch` instead of hard error
+  when in a with-clause a projection is used in a different fixity
+  (prefix vs. postfix) than in its parent clause.
+
+* New error warning `TooManyArgumentsToSort` instead of hard error.
+
+* New warning `EmptyPolarityPragma` for POLARITY pragma without polarities.
+  E.g. triggered by `{-# POLARITY F #-}`.
+
+* Warning `AbsurdPatternRequiresNoRHS` has been renamed to
+  `AbsurdPatternRequiresAbsentRHS`.
+
+* New option `--js-es6` for generating JavaScript with ES6 module syntax.
+
+* DISPLAY pragmas can now define display forms that match on defined names
+  beyond constructors ([issue #7533](https://github.com/agda/agda/issues/7533)).
+  Example:
+  ```agda
+  {-# DISPLAY Irrelevant Empty = ⊥ #-}
+  ```
+  `Empty` used to be interpreted as a pattern variable, effectively installing
+  the display form `Irrelevant _ = ⊥`.
+  Now `Empty` is treated as a matchable name, as one would intuitively expect
+  from a display form.
+  As a consequence, only `Irrelevant Empty` is displayed as `⊥`, not just any
+  `Irrelevant A`.
 
 Syntax
 ------
 
 Additions to the Agda syntax.
 
-* Left-hand side let: `using x ← e`
-  ([PR #7078](https://github.com/agda/agda/pull/7078))
-
-  This new construct can be use in left-hand sides together with `with` and
-  `rewrite` to give names to subexpressions. It is the left-hand side
-  counterpart of a `let`-binding and supports the same limited form of pattern
-  matching on eta-expandable record values.
-
-  It can be quite useful when you have a function doing a series of nested
-  `with`s that share some expressions. Something like
+* Add new literate agda: forester, see [#7403](https://github.com/agda/agda/pull/7403)
+* Records can now be created using module-like syntax in place of curly braces
+  and semicolons.
 
   ```agda
-  fun : A → B
-  fun x using z ← e with foo z
-  ... | p with bar z
-  ...   | q = r
+  p : Pair Nat Nat
+  p = record where
+    fst = 2
+    snd = 3
   ```
 
-  Here the expression `e` doesn't have to be repeated in the two `with`-expressions.
+  In a `record where` block, definitions have the semantics of let-bindings: they
+  can refer to earlier bindings and may include other definitions than the fields
+  of the record, including opening of modules. For instance,
 
-  As in a `with`, multiple bindings can be separated by a `|`, and variables to
-  the left are in scope in bindings to the right.
-
-* Pattern synonyms can now expose existing instance arguments
-  ([PR 7173](https://github.com/agda/agda/pull/7173)).
-  Example:
   ```agda
-  data D : Set where
-    c : {{D}} → D
-
-  pattern p {{d}} = c {{d}}
+  p₁ : Pair Nat Nat
+  p₁ = record where
+    open Pair p using (fst)
+    n   = fst * 2
+    snd = n * n
   ```
-  This allows us to explicitly bind these argument in a pattern match
-  and supply them explicitly when using the pattern synonym in an expression.
+
+  The syntax also works for record updates
+
   ```agda
-  f : D → D
-  f (p {{d = x}}) = p {{d = x}}
+  p₂ : Pair Nat Nat
+  p₂ = record p₁ where
+    snd = snd p₁ + 1
   ```
 
-  We cannot create new instance arguments this way, though.
-  The following is rejected:
-  ```agda
-  data D : Set where
-    c : D → D
+  See [#4275](https://github.com/agda/agda/issues/4275) for the proposal.
 
-  pattern p {{d}} = c d
-  ```
-
+* It is now always possible to refer to the name of a record type's
+  constructor, even if a name was not explicitly specified. This is done
+  using the new `(Record name).constructor` syntax; See [issue
+  #6964](https://github.com/agda/agda/issues/6964) for the motivation.
 
 Language
 --------
 
 Changes to type checker and other components defining the Agda language.
 
-* Agda now uses *discrimination trees* to store and look up instance
-  definitions, rather than linearly searching through all instances for
-  a given "class" ([PR #7109](https://github.com/agda/agda/pull/7109)).
-
-  This is a purely internal change, and should not result in any change
-  to which programs are accepted or rejected. However, it significantly
-  improves the performance of instance search, especially for the case
-  of a "type class" indexed by a single type argument. The new lookup
-  procedure should never be slower than the previous implementation.
-
 Reflection
 ----------
 
 Changes to the meta-programming facilities.
 
-* Add new primitive to run instance search from reflection code:
+* New reflection primitive: `checkFromStringTC : String → Type → TC Term`
 
-  ```agda
-    -- Try to solve open instance constraints. When wrapped in `noConstraints`,
-    -- fails if there are unsolved instance constraints left over that originate
-    -- from the current macro invokation. Outside constraints are still attempted,
-    -- but failure to solve them are ignored by `noConstraints`.
-    solveInstanceConstraints : TC ⊤
-  ```
+  Parse and type check the given string against the given type, returning
+  the resulting term (when successful).
+
 
 Library management
 ------------------
@@ -147,46 +120,42 @@ Library management
 Interaction and emacs mode
 --------------------------
 
-* The Auto command has been reimplemented from the ground up
-  ([PR #6410](https://github.com/agda/agda/pull/6410)).
-  This fixes problems where Auto would fail in the presence of language features
-  it did not know about, such as copatterns or anything cubical.
+* Agda's error messages now follow the [GNU standard](https://www.gnu.org/prep/standards/html_node/Errors.html).
+  To comply with this policy, line and column are now separated by a dot instead of comma.
+  The format of regular errors and error warnings follows this template:
 
-  The reimplementation does not support case splitting (`-c`), disproving
-  (`-d`) or refining (`-r`).
+  > _sourcefile_:_line1_._column1_-_line2_._column2_: error: [_ErrorName_]
+  > ...
+  > _error message_
+  > ...
+  > when _error context_
+
+  _line2_ or even _column2_ can be missing, in some cases even the entire error location.
+  Internal errors might follow a different format.
+
+  Warnings are printed in a similar format:
+
+  > _sourcefile_:_line1_._column1_-_line2_._column2_: warning: -W[no]_WarningName_
+  > ...
+  > _warning text_
+  > ...
+  > when _warning context_
+
+* Emacs: new face `agda2-highlight-cosmetic-problem-face`
+  for highlighting the new aspect `CosmeticProblem`.
+
+* Emacs: new face `agda2-highlight-instance-problem-face`
+  for highlighting the new aspect `InstanceProblem`.
+
 
 Backends
 --------
 
-API
----
-
-Highlighting some changes to Agda as a library.
-
-* New module `Agda.Syntax.Common.KeywordRange` providing type `KwRange` isomorphic to `Range`
-  to indicate source positions that just span keywords ([PR #7162](https://github.com/agda/agda/pull/7162)).
-  The motivation for `KwRange` is to distinguish such ranges from ranges for whole subtrees,
-  e.g. in data type `Agda.Syntax.Concrete.Declaration`.
-
-  API:
-  ```haskell
-  module Agda.Syntax.Common.KeywordRange where
-
-  type KwRange
-
-  -- From Range to KwRange
-  kwRange :: HasRange a => a -> KwRange
-
-  -- From KwRange to Range
-  instance HasRange KwRange where
-    getRange :: KwRange -> Range
-  ```
-
 Other issues closed
 -------------------
 
-For 2.6.5, the following issues were also
-[closed](https://github.com/agda/agda/issues?q=is%3Aissue+milestone%3A2.6.5+is%3Aclosed)
+For 2.8.0, the following issues were also
+[closed](https://github.com/agda/agda/issues?q=is%3Aissue+milestone%3A2.8.0+is%3Aclosed)
 (see [bug tracker](https://github.com/agda/agda/issues)):
 
-NOTE: This section will be filled by output produced with `closed-issues-for-milestone 2.6.5`.
+NOTE: This section will be filled by output produced with `closed-issues-for-milestone 2.8.0`.

@@ -1,11 +1,8 @@
 {-# OPTIONS_GHC -Wunused-imports #-}
 
-{-# LANGUAGE ScopedTypeVariables #-}
-
 module Agda.TypeChecking.Level.Solve where
 
-import Control.Monad
-import Control.Monad.Except
+import Control.Monad.Except ( catchError )
 
 import qualified Data.Map.Strict as MapS
 import Data.Maybe
@@ -24,7 +21,10 @@ import Agda.TypeChecking.Telescope
 import Agda.Utils.Functor
 import Agda.Utils.Monad
 
--- | Run the given action. At the end take all new metavariables of
+-- | Run the given action.
+--   If @--cumulativity@ is off, that's it.
+--
+--   Otherwise, at the end, take all new metavariables of
 --   type level for which the only constraints are upper bounds on the
 --   level, and instantiate them to the lowest level.
 defaultOpenLevelsToZero :: (PureTCM m, MonadMetaSolver m) => m a -> m a
