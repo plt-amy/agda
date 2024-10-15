@@ -22,7 +22,7 @@ import GHC.TypeLits (symbolVal)
 
 import Language.LSP.Protocol.Message
 import Language.LSP.Protocol.Types
-import Language.LSP.Protocol.Lens
+import Language.LSP.Protocol.Lens as Lsp
 import Language.LSP.Test as LspT
 
 
@@ -93,7 +93,17 @@ waitForReload = worker [] where
 waitForSuccessfulReload :: Session ()
 waitForSuccessfulReload = do
   diags <- waitForReload
-  when (diags /= []) $ liftIO $ throw UnexpectedDiagnostics
+  unless (all canIgnoreError diags) $ liftIO $ do
+    print diags
+    throw UnexpectedDiagnostics
+
+  where
+    canIgnoreError err
+      -- Ignore unsolved metas
+      | Just DiagnosticSeverity_Warning <- err ^. Lsp.severity
+      , "Unsolved interaction meta" <- err ^. Lsp.message
+      = True
+      | otherwise = False
 
 -- | Wait for an Agda file to be reloaded, and assert that it reported no errors.
 saveFile :: TextDocumentIdentifier -> Session ()

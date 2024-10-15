@@ -90,6 +90,9 @@ instance ToDiagnostic TCWarning where
     InteractionMetaBoundaries mvs -> flip foldMap mvs \rng ->
       info rng "This interaction point has unsolved boundary constraints."
 
+    UnsolvedInteractionMetas mvs -> flip foldMap mvs \rng ->
+      warning rng "Unsolved interaction meta"
+
     w -> warning warn (prettyWarning w)
     -- _ -> error "TODO"
 

@@ -1019,12 +1019,12 @@ test-suite agda-tests
     , base
     , bytestring
     , containers
-    , data-default     >= 0.7       && < 0.8
+    , data-default     >= 0.7      && < 0.8
     , directory
     , filepath
-    , filemanip        >= 0.3.6.3 && < 0.4
-    , lsp-test         >= 0.17    && < 0.18
-    , lsp-types        >= 2.2.0.0   && < 2.3
+    , filemanip        >= 0.3.6.3  && < 0.4
+    , lsp-test         >= 0.17     && < 0.18
+    , lsp-types        >= 2.2.0.0  && < 2.3
     , mtl
     , process
     , process-extras

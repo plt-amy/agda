@@ -1075,6 +1075,3 @@ lspHandlers caps = mconcat
   , getCodeActions
   , executeAgdaCommand
   ]
-
--- tryError :: MonadError e m => m a -> m (Either e a)
--- tryError = (`catchError` pure . Left) . fmap Right
