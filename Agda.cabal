@@ -949,6 +949,7 @@ test-suite agda-tests
       Internal.Interaction.Highlighting.Range
       Internal.Interaction.Library
       Internal.Interaction.Options
+      Internal.Interaction.Lsp.GoToDefinition
       Internal.Interaction.Lsp.Interaction
       Internal.Interaction.Lsp.Tests
       Internal.Interaction.Lsp.Utils

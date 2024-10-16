@@ -132,6 +132,7 @@ import Agda.Interaction.Options.Warnings (unsolvedWarnings)
 import Agda.Interaction.MakeCase (makeCase)
 
 import Agda.VersionCommit
+import Language.LSP.Protocol.Lens (HasCharacter(character))
 
 syncOptions :: TextDocumentSyncOptions
 syncOptions = TextDocumentSyncOptions
@@ -714,8 +715,10 @@ findAspect delta pos =
 
   where
     contains (range, aspect) = do
-      r <- toUpdatedPosition delta range
-      guard (positionInRange pos r)
+      r@(Lsp.Range sp ep) <- toUpdatedPosition delta range
+      -- This check is inclusive (unlike positionInRange), as to handle the case
+      -- where the cursor is to the right of the identifier.
+      guard (sp <= pos && pos <= ep)
       pure (r, aspect)
 
 highlightReferences :: Handlers WorkerM

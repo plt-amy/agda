@@ -24,16 +24,16 @@ giveAddsParentheses = testCase "Give adds parentheses" $ runAgdaSession def lspR
   let uriDoc = doc ^. Lsp.uri
   waitForSuccessfulReload
 
-  insertText doc (Position 7 23) "add {!!} {!!} "
+  insertText doc (Position 6 23) "add {!!} {!!} "
 
-  [Goal {goalRange = Range (Position 7 20) (Position 7 39)}] <- goalQuery doc $ Query_AllGoals False
-  res <- executeCommand (toCommand "Give" (Command_Give uriDoc (Position 7 20)))
+  [Goal {goalRange = Range (Position 6 20) (Position 6 39)}] <- goalQuery doc $ Query_AllGoals False
+  res <- executeCommand (toCommand "Give" (Command_Give uriDoc (Position 6 20)))
 
   newContents <- getDocumentEdit doc
-  liftIO $ Text.lines newContents !! 7 @?= "add (suc x) y = suc (add {!!} {!!})"
+  liftIO $ Text.lines newContents !! 6 @?= "add (suc x) y = suc (add {!!} {!!})"
 
-  ( [ Goal {goalRange = Range (Position 7 25) (Position 7 29)}
-    , Goal {goalRange = Range (Position 7 30) (Position 7 34)} ] ) <- goalQuery doc $ Query_AllGoals False
+  ( [ Goal {goalRange = Range (Position 6 25) (Position 6 29)}
+    , Goal {goalRange = Range (Position 6 30) (Position 6 34)} ] ) <- goalQuery doc $ Query_AllGoals False
 
   pure ()
 
@@ -43,21 +43,21 @@ giveReplacesHoles = testCase "Give replaces holes" $ runAgdaSession def lspRoot 
   let uriDoc = doc ^. Lsp.uri
   waitForSuccessfulReload
 
-  insertText doc (Position 7 23) "add ? (suc ?) "
+  insertText doc (Position 6 23) "add ? (suc ?) "
 
-  [Goal {goalRange = Range (Position 7 20) (Position 7 39)}] <- goalQuery doc $ Query_AllGoals False
-  res <- executeCommand (toCommand "Give" (Command_Give uriDoc (Position 7 20)))
+  [Goal {goalRange = Range (Position 6 20) (Position 6 39)}] <- goalQuery doc $ Query_AllGoals False
+  res <- executeCommand (toCommand "Give" (Command_Give uriDoc (Position 6 20)))
 
   newContents <- getDocumentEdit doc
-  liftIO $ Text.lines newContents !! 7 @?= "add (suc x) y = suc (add {! !} (suc {! !}))"
+  liftIO $ Text.lines newContents !! 6 @?= "add (suc x) y = suc (add {! !} (suc {! !}))"
 
-  ( [ Goal {goalRange = Range (Position 7 25) (Position 7 30)}
-    , Goal {goalRange = Range (Position 7 36) (Position 7 41)} ] ) <- goalQuery doc $ Query_AllGoals False
+  ( [ Goal {goalRange = Range (Position 6 25) (Position 6 30)}
+    , Goal {goalRange = Range (Position 6 36) (Position 6 41)} ] ) <- goalQuery doc $ Query_AllGoals False
 
   tokens <- getAbsSemanticTokens doc
   let
     token = SemanticTokenAbsolute
-      { _line = 7
+      { _line = 6
       , _startChar = 32
       , _length = 3
       , _tokenType = SemanticTokenTypes_EnumMember
