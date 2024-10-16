@@ -558,6 +558,7 @@ library
       Agda.LSP.Monad.Config
       Agda.LSP.Output
       Agda.LSP.Position
+      Agda.LSP.SemanticHighlighting
       Agda.LSP.Translation
       Agda.LSP.Utils
       Agda.Main

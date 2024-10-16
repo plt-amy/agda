@@ -81,6 +81,7 @@ import Agda.TypeChecking.Opacity (saturateOpaqueBlocks)
 import qualified Agda.Syntax.Parser as Pa
 import qualified Agda.Syntax.Parser.Tokens as T
 
+import Agda.LSP.SemanticHighlighting
 import Agda.LSP.Translation
 import Agda.LSP.Diagnostic
 import Agda.LSP.Position

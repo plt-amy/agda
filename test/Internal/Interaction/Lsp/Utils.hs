@@ -27,11 +27,9 @@ import Language.LSP.Test as LspT
 
 
 import qualified Agda.Syntax.Concrete as C
-import Agda.Syntax.Literal
 
-import Agda.LSP.Translation
+import Agda.LSP.SemanticHighlighting
 import Agda.LSP.Goal
-import Agda.LSP.Output
 
 import Agda.Utils.CallStack
 import Agda.Utils.Lens
