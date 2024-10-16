@@ -45,7 +45,7 @@ import GHC.Generics
 import Language.LSP.Protocol.Message
 import Language.LSP.Protocol.Types as Lsp
 import Language.LSP.Protocol.Lens
-import Language.LSP.Server
+import Language.LSP.Server as Lsp
 import Language.LSP.VFS hiding (start, end, line, character)
 
 import System.Exit
@@ -187,7 +187,7 @@ lspInit
   :: TCM ()
   -> LanguageContextEnv LspConfig
   -> TMessage 'Method_Initialize
-  -> IO (Either ResponseError LspState)
+  -> IO (Either (TResponseError 'Method_Initialize) LspState)
 lspInit setup config init = do
   workers  <- newMVar mempty
 
@@ -403,9 +403,9 @@ isQuestion InteractionPoint{ipRange = r}
 isQuestion _ = False
 
 requestHandlerTCM
-  :: forall (m :: Method 'ClientToServer 'Request) a. SMethod m
+  :: forall (m :: Method 'ClientToServer 'Request). SMethod m
   -> (TRequestMessage m -> Uri)
-  -> (TRequestMessage m -> (Either ResponseError (MessageResult m) -> Task ()) -> Task a)
+  -> Lsp.Handler Task m
   -> Handlers WorkerM
 requestHandlerTCM method uri cont = requestHandler method \req res -> withRunInIO \run -> run do
   runAtURI (uri req) $ void $ cont req \m -> liftIO (run (res m))
@@ -569,9 +569,9 @@ goal = requestHandler (SMethod_CustomMethod (Proxy :: Proxy "agda/query")) \req 
       reportSLn "lsp.query" 10 $ show q
       out <- tryError (fillQuery query)
       case out of
-        Left err  -> liftIO . run . res $ Left $ ResponseError (InL LSPErrorCodes_RequestFailed) "Request failed" Nothing
+        Left err  -> liftIO . run . res $ Left $ TResponseError (InL LSPErrorCodes_RequestFailed) "Request failed" Nothing
         Right out -> liftIO . run . res $ Right $ toJSON out
-    Aeson.Error e -> liftIO . run . res $ Left $ ResponseError (InL LSPErrorCodes_RequestFailed) (Text.pack e) Nothing
+    Aeson.Error e -> liftIO . run . res $ Left $ TResponseError (InL LSPErrorCodes_RequestFailed) (Text.pack e) Nothing
     -- pure ()
 
 namedCompletionItem :: Text.Text -> CompletionItem
@@ -788,9 +788,9 @@ getCodeActions = requestHandlerTCM SMethod_TextDocumentCodeAction (view (params 
 -- | Handle a command inside the TCM monad.
 commandHandlerTCM
   :: Uri
-  -> (Either ResponseError (Value |? Null) -> WorkerM ())
+  -> (Either (TResponseError 'Method_WorkspaceExecuteCommand) (Value |? Null) -> WorkerM ())
   -> ((forall a. WorkerM a -> IO a)
-    -> Task (Either ResponseError (Value |? Null)))
+    -> Task (Either (TResponseError 'Method_WorkspaceExecuteCommand) (Value |? Null)))
   -> WorkerM ()
 commandHandlerTCM uri res cont = withRunInIO \run -> run $
   runAtURI uri (cont run >>= (liftIO . run . res))
@@ -799,9 +799,9 @@ commandHandlerTCM uri res cont = withRunInIO \run -> run $
 commandHandlerInteractionPoint
   :: Uri
   -> Lsp.Position
-  -> (Either ResponseError (Value |? Null) -> WorkerM ())
+  -> (Either (TResponseError 'Method_WorkspaceExecuteCommand) (Value |? Null) -> WorkerM ())
   -> (InteractionPointInfo -> (Agda.Range, Int, Text.Text)
-    -> Task (Either ResponseError (Value |? Null)))
+    -> Task (Either (TResponseError 'Method_WorkspaceExecuteCommand) (Value |? Null)))
   -> WorkerM ()
 commandHandlerInteractionPoint uri pos res cont = commandHandlerTCM uri res \run -> do
   pos <- findInteractionPoint pos
@@ -813,7 +813,7 @@ commandHandlerInteractionPoint uri pos res cont = commandHandlerTCM uri res \run
       -> cont i contents
 
     _ -> pure . Left $
-      ResponseError (InL LSPErrorCodes_RequestFailed) "Cannot find interaction at this point" Nothing
+      TResponseError (InL LSPErrorCodes_RequestFailed) "Cannot find interaction at this point" Nothing
 
 removeHighlightingFor :: (Agda.HasRange a, MonadTCState m) => a -> m ()
 removeHighlightingFor x = modifyTCLens' stSyntaxInfo \map -> snd (insideAndOutside (rangeToRange (getRange x)) map)
@@ -822,7 +822,7 @@ executeAgdaCommand :: Handlers WorkerM
 executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res -> do
   lspDebug $ show (req ^. params)
   case parseCommand (req ^. params) of
-    Aeson.Error e -> res (Left (ResponseError (InL LSPErrorCodes_RequestFailed) (Text.pack e) Nothing))
+    Aeson.Error e -> res (Left (TResponseError (InL LSPErrorCodes_RequestFailed) (Text.pack e) Nothing))
     Aeson.Success (Command_Auto uri pos) -> commandHandlerInteractionPoint uri pos res \(ii, ip, range) (inner, _, contents) -> do
       -- TODO: What's the proper range here? This gets passed from the elisp side, so
       -- I think it's the *inside* of the interaction point, after edits have been applied.
@@ -900,7 +900,7 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res -> 
 
             pure (Right (InR Lsp.Null))
 
-          Nothing -> pure (Left (ResponseError (InL LSPErrorCodes_RequestFailed) "The clause to which this interaction point belongs does not have a range. Try reloading?" Nothing))
+          Nothing -> pure (Left (TResponseError (InL LSPErrorCodes_RequestFailed) "The clause to which this interaction point belongs does not have a range. Try reloading?" Nothing))
 
     Aeson.Success (Command_Reload uri) -> runAtURI uri reloadURI
 
@@ -971,14 +971,14 @@ executeAgdaCommand = requestHandler SMethod_WorkspaceExecuteCommand \req res -> 
 
     giveHandler
       :: Text.Text -> (UseForce -> InteractionId -> Maybe Agda.Range -> A.Expr -> TCM A.Expr)
-      -> Uri -> Lsp.Position -> (Either ResponseError (Value |? Null) -> WorkerM ())
+      -> Uri -> Lsp.Position -> (Either (TResponseError 'Method_WorkspaceExecuteCommand) (Value |? Null) -> WorkerM ())
       -> WorkerM ()
     giveHandler name give uri pos res = commandHandlerInteractionPoint uri pos res (runGive name give)
 
     runGive
       :: Text.Text -> (UseForce -> InteractionId -> Maybe Agda.Range -> A.Expr -> TCM A.Expr)
       -> InteractionPointInfo -> (Agda.Range, Int, Text.Text)
-      -> Task (Either ResponseError (Value |? Null))
+      -> Task (Either (TResponseError 'Method_WorkspaceExecuteCommand) (Value |? Null))
     runGive name give (ii, ip, range) (inner, offset, contents) = do
       scope <- getInteractionScope ii
 

@@ -15,7 +15,9 @@ import Language.LSP.Server
 import Agda.LSP.Monad.Base
 
 -- | Send a basic workspace edit request to the client.
-sendWorkspaceEdit :: MonadLsp a m => Text.Text -> Map.Map Uri [TextEdit] -> (Either ResponseError ApplyWorkspaceEditResult -> m ()) -> m ()
+sendWorkspaceEdit :: MonadLsp a m => Text.Text -> Map.Map Uri [TextEdit]
+  -> (Either (TResponseError 'Method_WorkspaceApplyEdit) ApplyWorkspaceEditResult -> m ())
+  -> m ()
 sendWorkspaceEdit title changes wait =
   let
     edit = ApplyWorkspaceEditParams (Just title) $ WorkspaceEdit
