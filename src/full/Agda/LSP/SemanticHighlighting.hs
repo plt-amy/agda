@@ -14,68 +14,82 @@ import Language.LSP.Protocol.Lens as Lsp
 
 import Agda.Syntax.Common.Aspect as Asp
 
-import Agda.LSP.Translation
 import Agda.LSP.Position
 
 import qualified Agda.Utils.RangeMap as RangeMap
 import Agda.Utils.RangeMap (RangeMap)
 import Agda.Utils.Lens
 
+data ClientTokenLegend = ClientTokenLegend
+  { clientTokenTypes :: Set.Set Text.Text
+  , clientTokenModifiers :: Set.Set Text.Text
+  }
+  deriving (Show)
 
-instance ToLsp Aspect where
-  type LspType Aspect = Lsp.SemanticTokenTypes
-  toLsp = \case
-    Comment -> Lsp.SemanticTokenTypes_Comment
-    Keyword -> Lsp.SemanticTokenTypes_Keyword
-    String  -> Lsp.SemanticTokenTypes_String
-    Number  -> Lsp.SemanticTokenTypes_Number
-    Hole    -> Lsp.SemanticTokenTypes_Custom "interactionPoint"
-    Symbol  -> Lsp.SemanticTokenTypes_Custom "symbol"
-    PrimitiveType -> Lsp.SemanticTokenTypes_Custom "primitiveType"
-    Name Nothing _ -> Lsp.SemanticTokenTypes_Variable
-    Name (Just kind) _ -> case kind of
-      Asp.Bound                   -> Lsp.SemanticTokenTypes_Variable
-      Asp.Generalizable           -> Lsp.SemanticTokenTypes_TypeParameter
-      Asp.Constructor Inductive   -> Lsp.SemanticTokenTypes_EnumMember
-      Asp.Constructor CoInductive -> Lsp.SemanticTokenTypes_Custom "coinductiveCons"
-      Asp.Datatype                -> Lsp.SemanticTokenTypes_Enum
-      Asp.Field                   -> Lsp.SemanticTokenTypes_Property
-      Asp.Function                -> Lsp.SemanticTokenTypes_Function
-      Asp.Module                  -> Lsp.SemanticTokenTypes_Namespace
-      Asp.Postulate               -> Lsp.SemanticTokenTypes_Custom "postulate"
-      Asp.Primitive               -> Lsp.SemanticTokenTypes_Custom "primitive"
-      Asp.Record                  -> Lsp.SemanticTokenTypes_Struct
-      Asp.Argument                -> Lsp.SemanticTokenTypes_Parameter
-      Asp.Macro                   -> Lsp.SemanticTokenTypes_Macro
-    Pragma     -> Lsp.SemanticTokenTypes_Custom "pragma"
-    Background -> Lsp.SemanticTokenTypes_Custom "background"
-    Markup     -> Lsp.SemanticTokenTypes_Custom "markup"
-
--- | The token legend containing our custom semantic tokens.
-agdaTokenLegend :: Lsp.SemanticTokensLegend
-agdaTokenLegend = Lsp.SemanticTokensLegend
-  { _tokenTypes =
-    [ "comment", "keyword", "string", "number", "interactionPoint",
-    "symbol", "primitiveType", "variable", "typeParameter",
-    "enumMember", "coinductiveCons", "enum", "property", "function",
-    "namespace", "postulate", "primitive", "struct", "parameter",
-    "macro", "pragma", "background", "markup" ]
-  , _tokenModifiers = []
+createClientTokens :: SemanticTokensLegend -> ClientTokenLegend
+createClientTokens l = ClientTokenLegend
+  { clientTokenTypes = Set.fromList (l ^. tokenTypes)
+  , clientTokenModifiers = Set.fromList (l ^. tokenModifiers)
   }
 
+aspectToSemantic :: ClientTokenLegend -> Aspect -> Maybe (SemanticTokenTypes, [SemanticTokenModifiers])
+aspectToSemantic legend = \case
+    Comment -> Just (SemanticTokenTypes_Comment, [])
+    Keyword -> Just (SemanticTokenTypes_Keyword, [])
+    String  -> Just (SemanticTokenTypes_String, [])
+    Number  -> Just (SemanticTokenTypes_Number, [])
+    Hole    -> tryType "interactionPoint"
+    Symbol  -> tryType "symbol"
+    PrimitiveType -> tryType "primitiveType" <|> Just (SemanticTokenTypes_Type, [SemanticTokenModifiers_DefaultLibrary])
+    Name Nothing _ -> Just (SemanticTokenTypes_Variable, [])
+    Name (Just kind) _ -> case kind of
+      Asp.Bound                   -> Just (SemanticTokenTypes_Variable, [])
+      Asp.Generalizable           -> Just (SemanticTokenTypes_TypeParameter, [])
+      Asp.Constructor Inductive   -> Just (SemanticTokenTypes_EnumMember, [])
+      Asp.Constructor CoInductive -> tryType "coinductiveCons" <|> Just (SemanticTokenTypes_EnumMember, [])
+      Asp.Datatype                -> Just (SemanticTokenTypes_Enum, [])
+      Asp.Field                   -> Just (SemanticTokenTypes_Property, [])
+      Asp.Function                -> Just (SemanticTokenTypes_Function, [])
+      Asp.Module                  -> Just (SemanticTokenTypes_Namespace, [])
+      Asp.Postulate               -> tryType "postulate"
+      Asp.Primitive               -> tryType "primitive"
+      Asp.Record                  -> Just (SemanticTokenTypes_Struct, [])
+      Asp.Argument                -> Just (SemanticTokenTypes_Parameter, [])
+      Asp.Macro                   -> Just (SemanticTokenTypes_Macro, [])
+    Pragma     -> tryType "pragma" <|> Just (SemanticTokenTypes_Macro, [])
+    Background -> Nothing
+    Markup     -> Nothing
+
+    where
+      tryType :: Text.Text -> Maybe (SemanticTokenTypes, [SemanticTokenModifiers])
+      tryType ty
+        | ty `Set.member` (clientTokenTypes legend) = Just (SemanticTokenTypes_Custom ty, [])
+        | otherwise = Nothing
+
 -- | Convert an aspect map to a list of semantic tokens.
-aspectMapToTokens :: PosDelta -> RangeMap Aspects -> [Lsp.SemanticTokenAbsolute]
-aspectMapToTokens delta = mapMaybe go . RangeMap.toList where
+aspectMapToTokens :: ClientCapabilities -> PosDelta -> RangeMap Aspects -> [Lsp.SemanticTokenAbsolute]
+aspectMapToTokens caps delta = mapMaybe go . RangeMap.toList where
+  tokenCaps = (caps ^. textDocument) >>= view semanticTokens
+
+  -- If augmentsSyntaxTokens is set to False, then we always need to send
+  always = maybe False not $ tokenCaps >>= view augmentsSyntaxTokens
+
+  -- Compute the legend sent by the server.
+  legend = createClientTokens case tokenCaps of
+    Nothing -> defaultSemanticTokensLegend
+    Just l -> SemanticTokensLegend { _tokenTypes = l ^. tokenTypes , _tokenModifiers = l ^. tokenModifiers }
+
   go (range, aspect -> Just asp)
-    | isInteresting asp
+    | always || isInteresting asp
+    , Just (ty, mods) <- aspectToSemantic legend asp
     , Just range <- toUpdatedPosition delta range
     , (range ^. Lsp.start . Lsp.line) == (range ^. Lsp.end . Lsp.line)
     = Just Lsp.SemanticTokenAbsolute
-        { _tokenType      = toLsp asp
+        { _tokenType      = ty
         , _line           = range ^. Lsp.start . Lsp.line
         , _startChar      = range ^. Lsp.start . Lsp.character
         , _length         = range ^. Lsp.end . Lsp.character - range ^. Lsp.start . Lsp.character
-        , _tokenModifiers = []
+        , _tokenModifiers = mods
         }
   go _ = Nothing
 
@@ -91,3 +105,14 @@ aspectMapToTokens delta = mapMaybe go . RangeMap.toList where
   isInteresting Pragma        = False
   isInteresting Background    = False
   isInteresting Markup        = False
+
+-- | The full token legend used by Agda
+agdaTokenLegend :: Lsp.SemanticTokensLegend
+agdaTokenLegend = Lsp.SemanticTokensLegend
+  { _tokenTypes = defaultSemanticTokensLegend ^. tokenTypes ++
+      [ "interactionPoint", "symbol", "primitiveType"
+      , "coinductiveCons", "postulate", "pragma"
+      ]
+  , _tokenModifiers = defaultSemanticTokensLegend ^. tokenModifiers
+  }
+

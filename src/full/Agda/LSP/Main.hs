@@ -410,13 +410,13 @@ requestHandlerTCM
 requestHandlerTCM method uri cont = requestHandler method \req res -> withRunInIO \run -> run do
   runAtURI (uri req) $ void $ cont req \m -> liftIO (run (res m))
 
-provideSemanticTokens :: Handlers WorkerM
-provideSemanticTokens =
+provideSemanticTokens :: ClientCapabilities -> Handlers WorkerM
+provideSemanticTokens caps =
   requestHandlerTCM SMethod_TextDocumentSemanticTokensFull (view (params . textDocument . uri)) \req res -> do
   info <- useTC stSyntaxInfo
 
   delta <- getDelta
-  let tokens = aspectMapToTokens delta info
+  let tokens = aspectMapToTokens caps delta info
   reportSLn "lsp.highlighting.semantic" 10 $ "returning " <> show (Prelude.length tokens) <> " semantic tokens"
   reportSLn "lsp.highlighting.semantic" 666 $ unlines
     [ show (range, r) <> ": " <> show (aspect asp) | (range, asp) <- RangeMap.toList info, let r = toUpdatedPosition delta range]
@@ -1070,7 +1070,7 @@ lspHandlers caps = mconcat
   , onInitialized
   , onTextDocumentChange
   , notificationHandler SMethod_WorkspaceDidChangeConfiguration (const (pure ()))
-  , provideSemanticTokens
+  , provideSemanticTokens caps
   , goal
   , Agda.LSP.Main.completion
   , Agda.LSP.Main.onTypeFormatting
