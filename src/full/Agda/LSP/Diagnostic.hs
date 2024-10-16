@@ -93,6 +93,9 @@ instance ToDiagnostic TCWarning where
     UnsolvedInteractionMetas mvs -> flip foldMap mvs \rng ->
       warning rng "Unsolved interaction meta"
 
+    UnsolvedMetaVariables mvs -> flip foldMap mvs \rng ->
+      warning rng "Unsolved meta"
+
     w -> warning warn (prettyWarning w)
     -- _ -> error "TODO"
 
